@@ -104,8 +104,40 @@ impl PortalClient {
         Ok(results)
     }
 
+    /// Ensures the XDG Desktop Portal PermissionStore grants non-interactive screenshot
+    /// access to host binaries so Wayland freeze/screenshot capture operates without prompts.
+    fn ensure_screenshot_permission() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            for app_id in ["", "vexrec", "net.aerovex.vexrec"] {
+                let _ = std::process::Command::new("gdbus")
+                    .args([
+                        "call",
+                        "--session",
+                        "--dest",
+                        "org.freedesktop.impl.portal.PermissionStore",
+                        "--object-path",
+                        "/org/freedesktop/impl/portal/PermissionStore",
+                        "--method",
+                        "org.freedesktop.impl.portal.PermissionStore.SetPermission",
+                        "screenshot",
+                        "true",
+                        "screenshot",
+                        app_id,
+                        "['yes']",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        });
+    }
+
     /// Requests a single screenshot via the Screenshot portal interface
     pub async fn request_screenshot(&self, interactive: bool) -> Result<Url> {
+        if !interactive {
+            Self::ensure_screenshot_permission();
+        }
         info!(interactive, "Requesting Screenshot via XDG Desktop Portal");
         let response = Screenshot::request()
             .interactive(interactive)

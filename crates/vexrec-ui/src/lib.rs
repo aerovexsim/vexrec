@@ -19,26 +19,36 @@ use tracing::{error, info};
 pub const SOCKET_PATH: &str = "/tmp/vexrec.sock";
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/luxrec.sock";
 
-/// Sends a command to the running background daemon over UNIX socket
+/// Sends a command to the running background daemon over UNIX socket with a 5s timeout
 pub async fn send_daemon_command(cmd: &str) -> Result<String, String> {
     use tokio::net::UnixStream;
-    let stream_res = UnixStream::connect(SOCKET_PATH).await;
-    let mut stream = match stream_res {
-        Ok(s) => s,
-        Err(_) => UnixStream::connect(LEGACY_SOCKET_PATH)
+    let fut = async {
+        let stream_res = UnixStream::connect(SOCKET_PATH).await;
+        let mut stream = match stream_res {
+            Ok(s) => s,
+            Err(_) => UnixStream::connect(LEGACY_SOCKET_PATH)
+                .await
+                .map_err(|e| format!("Could not connect to vexrec daemon socket at {SOCKET_PATH}: {e}"))?,
+        };
+
+        stream
+            .write_all(format!("{cmd}\n").as_bytes())
             .await
-            .map_err(|e| format!("Could not connect to vexrec daemon socket at {SOCKET_PATH}: {e}"))?,
+            .map_err(|e| e.to_string())?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response = String::new();
+        let _ = reader.read_line(&mut response).await;
+        let trimmed = response.trim().to_string();
+        if let Some(err_msg) = trimmed.strip_prefix("ERR:") {
+            return Err(err_msg.trim().to_string());
+        }
+        Ok(trimmed)
     };
 
-    stream
-        .write_all(format!("{cmd}\n").as_bytes())
+    tokio::time::timeout(std::time::Duration::from_secs(5), fut)
         .await
-        .map_err(|e| e.to_string())?;
-
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    let _ = reader.read_line(&mut response).await;
-    Ok(response.trim().to_string())
+        .map_err(|_| format!("Timed out waiting for vexrec daemon at {SOCKET_PATH}"))?
 }
 
 /// Helper to start the UNIX domain socket server
@@ -84,7 +94,7 @@ fn spawn_socket_server(app_handle: tauri::AppHandle) {
                             match cmd {
                                 "freeze" => {
                                     if let Some(state) = app.try_state::<AppRecordingState>() {
-                                        if let Err(e) = trigger_freeze(&app, &state) {
+                                        if let Err(e) = trigger_freeze(&app, &state).await {
                                             error!("Error triggering freeze: {e}");
                                             let _ = writer.write_all(format!("ERR: {e}\n").as_bytes()).await;
                                         } else {
@@ -152,6 +162,8 @@ fn spawn_socket_server(app_handle: tauri::AppHandle) {
 
 /// Runs the Tauri application in either standard GUI mode or background daemon mode
 pub fn run_app_mode(_is_daemon: bool) {
+    vexrec_pipeline::x11_capture::X11CaptureEngine::sanitize_display_env();
+
     let app = tauri::Builder::default()
         .manage(AppRecordingState::default())
         .invoke_handler(tauri::generate_handler![

@@ -56,9 +56,61 @@ impl X11CaptureEngine {
         Ok(img)
     }
 
-    /// Checks if an active X11 display connection is available
+    /// Sanitizes DISPLAY if it points to GNOME's internal setup socket (GNOME_SETUP_DISPLAY),
+    /// which accepts connections on Wayland but blocks forever without replying.
+    pub fn sanitize_display_env() {
+        if let Ok(display) = std::env::var("DISPLAY") {
+            let is_setup_display = std::env::var("GNOME_SETUP_DISPLAY")
+                .map(|setup| setup == display)
+                .unwrap_or(false);
+            let is_wayland = std::env::var("XDG_SESSION_TYPE")
+                .map(|s| s.eq_ignore_ascii_case("wayland"))
+                .unwrap_or(false)
+                || std::env::var_os("WAYLAND_DISPLAY").is_some();
+
+            if (is_setup_display || (is_wayland && display == ":1"))
+                && std::path::Path::new("/tmp/.X11-unix/X0").exists()
+            {
+                std::env::set_var("DISPLAY", ":0");
+            }
+        }
+    }
+
+    /// Checks if a native full-screen X11 root window capture is available.
+    /// Returns false under Wayland sessions because rootless Xwayland root windows
+    /// have no backing pixmap and fail GetImage with BadMatch.
     pub fn is_available() -> bool {
-        x11rb::connect(None).is_ok()
+        Self::sanitize_display_env();
+
+        if std::env::var("XDG_SESSION_TYPE")
+            .map(|s| s.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        {
+            return false;
+        }
+
+        if let (Ok(display), Ok(setup_display)) = (
+            std::env::var("DISPLAY"),
+            std::env::var("GNOME_SETUP_DISPLAY"),
+        ) {
+            if display == setup_display {
+                return false;
+            }
+        }
+
+        let Ok((conn, screen_num)) = x11rb::connect(None) else {
+            return false;
+        };
+        let Some(screen) = conn.setup().roots.get(screen_num) else {
+            return false;
+        };
+        let root = screen.root;
+
+        conn.get_image(ImageFormat::Z_PIXMAP, root, 0, 0, 1, 1, !0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some()
     }
 
     /// Finds all top-level windows owned by the specified PID

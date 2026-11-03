@@ -260,6 +260,9 @@ async fn main() -> anyhow::Result<()> {
 
                 if let Ok(file_path) = uri.to_file_path() {
                     let mut img = image::open(&file_path)?.to_rgba8();
+                    if file_path != out_path {
+                        let _ = std::fs::remove_file(&file_path);
+                    }
 
                     if let Some(r) = crop_rect {
                         img = SnapshotEngine::crop_image(&img, r)?;

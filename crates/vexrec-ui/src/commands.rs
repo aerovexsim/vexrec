@@ -353,15 +353,35 @@ pub async fn stop_recording_internal(
     }
 }
 
-pub fn trigger_freeze(
+pub async fn trigger_freeze(
     app: &tauri::AppHandle,
     state: &AppRecordingState,
 ) -> Result<(), String> {
     // Ensure any existing freeze overlay is synchronously unmapped first
     hide_freeze_overlay(app);
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let img = X11CaptureEngine::capture_screen(None).map_err(|e| e.to_string())?;
+    let x11_native = X11CaptureEngine::is_available();
+    let img = if x11_native {
+        match X11CaptureEngine::capture_screen(None) {
+            Ok(captured) => captured,
+            Err(_) => {
+                let portal = PortalClient::new();
+                let uri = portal.request_screenshot(false).await.map_err(|e| e.to_string())?;
+                let file_path = uri.to_file_path().map_err(|_| "Invalid file URI".to_string())?;
+                let loaded = image::open(&file_path).map_err(|e| e.to_string())?.to_rgba8();
+                let _ = std::fs::remove_file(&file_path);
+                loaded
+            }
+        }
+    } else {
+        let portal = PortalClient::new();
+        let uri = portal.request_screenshot(false).await.map_err(|e| e.to_string())?;
+        let file_path = uri.to_file_path().map_err(|_| "Invalid file URI".to_string())?;
+        let loaded = image::open(&file_path).map_err(|e| e.to_string())?.to_rgba8();
+        let _ = std::fs::remove_file(&file_path);
+        loaded
+    };
     let (width, height) = img.dimensions();
 
     let freeze_path = PathBuf::from("/tmp/vexrec_freeze.png");
@@ -396,43 +416,46 @@ pub fn trigger_freeze(
     // Wait (bounded) until the overlay webview has decoded and committed this exact frame.
     // Mapping the window earlier shows the previous frame or an unpainted surface until the
     // user interacts with it.
-    {
+    tokio::task::block_in_place(|| {
         let acked = state.freeze_ack.lock().unwrap();
         let _ = state
             .freeze_ack_cv
             .wait_timeout_while(acked, std::time::Duration::from_millis(1200), |a| *a < seq)
             .unwrap();
-    }
+    });
 
     if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.set_fullscreen(true);
         let _ = overlay.set_always_on_top(true);
         let _ = overlay.set_skip_taskbar(true);
         overlay.show().map_err(|e| e.to_string())?;
         overlay.set_focus().map_err(|e| e.to_string())?;
     }
 
-    // Configure ONLY the full-screen overlay X11 window to UTILITY/ABOVE and request focus.
-    // The window must be viewable before the window manager honours _NET_ACTIVE_WINDOW, so
-    // wait for the map to complete and re-assert focus a few times to win any focus races.
-    let min_w = width.min(u16::MAX as u32) as u16;
-    let min_h = height.min(u16::MAX as u32) as u16;
-    let mut overlay_win = None;
-    for _ in 0..50 {
-        if let Ok(Some(w)) = X11CaptureEngine::find_overlay_window(std::process::id(), min_w, min_h) {
-            overlay_win = Some(w);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
-    if let Some(win) = overlay_win {
-        let _ = X11CaptureEngine::wait_until_viewable(win, std::time::Duration::from_millis(500));
-        let _ = X11CaptureEngine::configure_dock_overlay(win);
-        for attempt in 0..12u64 {
-            let _ = X11CaptureEngine::activate_and_grab_focus(win);
-            std::thread::sleep(std::time::Duration::from_millis(30 + attempt * 10));
-            if X11CaptureEngine::active_window() == Some(win) {
+    if x11_native {
+        // Configure ONLY the full-screen overlay X11 window to UTILITY/ABOVE and request focus.
+        // The window must be viewable before the window manager honours _NET_ACTIVE_WINDOW, so
+        // wait for the map to complete and re-assert focus a few times to win any focus races.
+        let min_w = width.min(u16::MAX as u32) as u16;
+        let min_h = height.min(u16::MAX as u32) as u16;
+        let mut overlay_win = None;
+        for _ in 0..50 {
+            if let Ok(Some(w)) = X11CaptureEngine::find_overlay_window(std::process::id(), min_w, min_h) {
+                overlay_win = Some(w);
                 break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        if let Some(win) = overlay_win {
+            let _ = X11CaptureEngine::wait_until_viewable(win, std::time::Duration::from_millis(500));
+            let _ = X11CaptureEngine::configure_dock_overlay(win);
+            for attempt in 0..12u64 {
+                let _ = X11CaptureEngine::activate_and_grab_focus(win);
+                std::thread::sleep(std::time::Duration::from_millis(30 + attempt * 10));
+                if X11CaptureEngine::active_window() == Some(win) {
+                    break;
+                }
             }
         }
     }
@@ -876,6 +899,9 @@ pub async fn capture_screenshot(
         let uri = portal.request_screenshot(false).await.map_err(|e| e.to_string())?;
         let file_path = uri.to_file_path().map_err(|_| "Invalid file URI".to_string())?;
         let mut loaded = image::open(&file_path).map_err(|e| e.to_string())?.to_rgba8();
+        if file_path != out_path {
+            let _ = std::fs::remove_file(&file_path);
+        }
         if let Some(r) = crop {
             loaded = SnapshotEngine::crop_image(&loaded, r).map_err(|e| e.to_string())?;
         }
