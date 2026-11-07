@@ -19,8 +19,10 @@ imageproc.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 dirs.workspace = true
-base64 = "0.22"
-tauri.workspace = true
+arboard.workspace = true
+gtk = { version = "0.18", features = ["v3_24"] }
+gdk = "0.18"
+gdk-pixbuf = "0.18"
+cairo-rs = "0.18"
+glib = "0.18"
 
-[build-dependencies]
-tauri-build.workspace = true

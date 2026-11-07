@@ -1,34 +1,158 @@
 pub mod annotator;
+pub mod app_state;
 pub mod commands;
+pub mod frame;
 pub mod hud;
+pub mod indicator;
+pub mod overlay;
 pub mod renderer;
 pub mod selection;
+pub mod settings;
 
 pub use annotator::{AnnotationCanvas, AnnotationTool};
+pub use app_state::AppState;
 pub use commands::*;
+pub use frame::RecordingFrameWindow;
 pub use hud::{CaptureMode, FloatingHudState};
+pub use indicator::RecordingIndicatorWindow;
+pub use overlay::{ActionMode, FreezeOverlayWindow, TargetMode};
 pub use renderer::AnnotationRenderer;
 pub use selection::SelectionManager;
+pub use settings::SettingsWindow;
 
+use gtk::prelude::*;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
-use tauri::Manager;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use std::rc::Rc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{error, info};
+use vexrec_core::geometry::Rect;
 
 pub const SOCKET_PATH: &str = "/tmp/vexrec.sock";
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/luxrec.sock";
 
+const DARK_CSS: &str = r#"
+window {
+    background-color: transparent;
+}
+
+.freeze-pill {
+    background-color: rgba(24, 24, 27, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 20px;
+    padding: 6px 12px;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+}
+
+.pill-group {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 2px;
+}
+
+.pill-separator {
+    background-color: rgba(255, 255, 255, 0.15);
+    margin: 4px 6px;
+}
+
+.pill-button {
+    background: transparent;
+    border: none;
+    border-radius: 9px;
+    color: #a1a1aa;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 5px 11px;
+    box-shadow: none;
+    transition: all 120ms ease;
+}
+
+.pill-button:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+.pill-button.active {
+    background-color: rgba(255, 255, 255, 0.22);
+    color: #ffffff;
+}
+
+.action-btn-done {
+    background-color: #ffffff;
+    border: none;
+    border-radius: 12px;
+    color: #09090b;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 6px 16px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+
+.action-btn-done:hover {
+    background-color: #f4f4f5;
+}
+
+.action-btn-record {
+    background-color: #ef4444;
+    border: none;
+    border-radius: 12px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 6px 16px;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
+}
+
+.action-btn-record:hover {
+    background-color: #dc2626;
+}
+
+.indicator-pill {
+    background-color: rgba(24, 24, 27, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 14px;
+    padding: 3px 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+
+.indicator-pill:hover {
+    background-color: #27272a;
+    border-color: rgba(255, 255, 255, 0.35);
+}
+
+.indicator-time {
+    color: #ffffff;
+    font-family: monospace;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.settings-window {
+    background-color: #18181b;
+    color: #f4f4f5;
+}
+"#;
+
+#[derive(Clone, Debug)]
+pub enum UiCommand {
+    ShowFreeze,
+    CancelFreeze,
+    ShowRecording { crop: Option<Rect>, show_frame: bool },
+    HideRecording,
+}
+
 /// Sends a command to the running background daemon over UNIX socket with a 5s timeout
 pub async fn send_daemon_command(cmd: &str) -> Result<String, String> {
-    use tokio::net::UnixStream;
+    use tokio::net::UnixStream as TokioUnixStream;
     let fut = async {
-        let stream_res = UnixStream::connect(SOCKET_PATH).await;
+        let stream_res = TokioUnixStream::connect(SOCKET_PATH).await;
         let mut stream = match stream_res {
             Ok(s) => s,
-            Err(_) => UnixStream::connect(LEGACY_SOCKET_PATH)
+            Err(_) => TokioUnixStream::connect(LEGACY_SOCKET_PATH)
                 .await
-                .map_err(|e| format!("Could not connect to vexrec daemon socket at {SOCKET_PATH}: {e}"))?,
+                .map_err(|e| format!("Could not connect to vexrec daemon at {SOCKET_PATH}: {e}"))?,
         };
 
         stream
@@ -36,7 +160,7 @@ pub async fn send_daemon_command(cmd: &str) -> Result<String, String> {
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut reader = BufReader::new(stream);
+        let mut reader = tokio::io::BufReader::new(stream);
         let mut response = String::new();
         let _ = reader.read_line(&mut response).await;
         let trimmed = response.trim().to_string();
@@ -51,171 +175,205 @@ pub async fn send_daemon_command(cmd: &str) -> Result<String, String> {
         .map_err(|_| format!("Timed out waiting for vexrec daemon at {SOCKET_PATH}"))?
 }
 
-/// Helper to start the UNIX domain socket server
-fn spawn_socket_server(app_handle: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let socket_path = Path::new(SOCKET_PATH);
-        if socket_path.exists() {
-            // Check if socket is active
-            if send_daemon_command("ping").await.is_ok() {
-                info!("Another daemon instance is active on socket");
-                return;
-            }
-            let _ = std::fs::remove_file(socket_path);
+fn apply_dark_theme() {
+    let provider = gtk::CssProvider::new();
+    if provider.load_from_data(DARK_CSS.as_bytes()).is_ok() {
+        if let Some(screen) = gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
         }
-        let legacy_path = Path::new(LEGACY_SOCKET_PATH);
-        let _ = std::fs::remove_file(legacy_path);
+    }
+}
 
-        let listener = match UnixListener::bind(socket_path) {
-            Ok(l) => {
-                // Symlink legacy socket to current socket for backwards compatibility
-                let _ = std::os::unix::fs::symlink(socket_path, legacy_path);
-                l
-            }
-            Err(e) => {
-                error!("Failed to bind UNIX socket at {}: {}", SOCKET_PATH, e);
-                return;
-            }
-        };
+/// Spawns the synchronous background socket listener
+fn spawn_native_socket_server(
+    app_state: AppState,
+    ui_sender: glib::Sender<UiCommand>,
+) {
+    let socket_path = Path::new(SOCKET_PATH);
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(socket_path);
+    }
+    let legacy_path = Path::new(LEGACY_SOCKET_PATH);
+    let _ = std::fs::remove_file(legacy_path);
 
-        info!("Vexrec daemon socket listening on {}", SOCKET_PATH);
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => {
+            let _ = std::os::unix::fs::symlink(socket_path, legacy_path);
+            l
+        }
+        Err(e) => {
+            error!("Failed to bind UNIX socket at {}: {}", SOCKET_PATH, e);
+            return;
+        }
+    };
 
-        loop {
-            match listener.accept().await {
-                Ok((mut stream, _)) => {
-                    let app = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let (reader, mut writer) = stream.split();
-                        let mut buf_reader = BufReader::new(reader);
-                        let mut line = String::new();
-                        if buf_reader.read_line(&mut line).await.is_ok() {
-                            let cmd = line.trim();
-                            info!(cmd, "Received socket command");
-                            match cmd {
-                                "freeze" => {
-                                    if let Some(state) = app.try_state::<AppRecordingState>() {
-                                        if let Err(e) = trigger_freeze(&app, &state).await {
-                                            error!("Error triggering freeze: {e}");
-                                            let _ = writer.write_all(format!("ERR: {e}\n").as_bytes()).await;
-                                        } else {
-                                            let _ = writer.write_all(b"OK: freeze\n").await;
-                                        }
-                                    }
-                                }
-                                "start_recording" => {
-                                    if let Some(state) = app.try_state::<AppRecordingState>() {
-                                        match start_recording(
-                                            app.clone(),
-                                            state,
-                                            None,
-                                            None,
-                                            Some(60),
-                                            Some("mp4".into()),
-                                            Some(true),
-                                            Some(true),
-                                        ).await {
-                                            Ok(_) => {
-                                                let _ = writer.write_all(b"OK: recording started\n").await;
-                                            }
-                                            Err(e) => {
-                                                let _ = writer.write_all(format!("ERR: {e}\n").as_bytes()).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                "stop_recording" => {
-                                    if let Some(state) = app.try_state::<AppRecordingState>() {
-                                        match stop_recording_internal(&app, &state).await {
-                                            Ok(Some(res)) => {
-                                                let _ = writer.write_all(format!("OK: {}\n", res.file_path).as_bytes()).await;
-                                            }
-                                            Ok(None) => {
-                                                let _ = writer.write_all(b"OK: no active recording\n").await;
-                                            }
-                                            Err(e) => {
-                                                let _ = writer.write_all(format!("ERR: {e}\n").as_bytes()).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                "cancel_freeze" => {
-                                    hide_freeze_overlay(&app);
-                                    let _ = writer.write_all(b"OK: freeze cancelled\n").await;
-                                }
-                                "ping" => {
-                                    let _ = writer.write_all(b"pong\n").await;
-                                }
-                                other => {
-                                    let _ = writer.write_all(format!("UNKNOWN: {other}\n").as_bytes()).await;
-                                }
+    info!("Vexrec daemon native socket listening on {}", SOCKET_PATH);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                let cmd = line.trim();
+                info!(cmd, "Received socket command");
+                match cmd {
+                    "freeze" => {
+                        let _ = ui_sender.send(UiCommand::ShowFreeze);
+                        let _ = stream.write_all(b"OK: freeze\n");
+                    }
+                    "stop_recording" => {
+                        let state = app_state.clone();
+                        let rt = tokio::runtime::Runtime::new();
+                        let res = if let Ok(r) = rt {
+                            r.block_on(async { stop_recording_internal(&state).await })
+                        } else {
+                            Err("Failed to start runtime".into())
+                        };
+
+                        let _ = ui_sender.send(UiCommand::HideRecording);
+
+                        match res {
+                            Ok(Some(r)) => {
+                                let _ = stream.write_all(format!("OK: {}\n", r.file_path).as_bytes());
+                            }
+                            Ok(None) => {
+                                let _ = stream.write_all(b"OK: no active recording\n");
+                            }
+                            Err(e) => {
+                                let _ = stream.write_all(format!("ERR: {e}\n").as_bytes());
                             }
                         }
-                    });
-                }
-                Err(e) => {
-                    error!("Error accepting socket connection: {e}");
+                    }
+                    "cancel_freeze" => {
+                        let _ = ui_sender.send(UiCommand::CancelFreeze);
+                        let _ = stream.write_all(b"OK: freeze cancelled\n");
+                    }
+                    "ping" => {
+                        let _ = stream.write_all(b"pong\n");
+                    }
+                    other => {
+                        let _ = stream.write_all(format!("UNKNOWN: {other}\n").as_bytes());
+                    }
                 }
             }
         }
     });
 }
 
-/// Runs the Tauri application in either standard GUI mode or background daemon mode
-pub fn run_app_mode(_is_daemon: bool) {
-    vexrec_pipeline::x11_capture::X11CaptureEngine::sanitize_display_env();
-
-    let app = tauri::Builder::default()
-        .manage(AppRecordingState::default())
-        .invoke_handler(tauri::generate_handler![
-            commands::get_system_status,
-            commands::get_config,
-            commands::save_config,
-            commands::capture_screenshot,
-            commands::copy_image_to_clipboard,
-            commands::get_autostart,
-            commands::set_autostart,
-            commands::get_system_screenshot_status,
-            commands::replace_system_screenshot,
-            commands::get_window_position,
-            commands::set_window_position,
-            commands::open_settings_window,
-            commands::get_freeze_data,
-            commands::freeze_frame_ready,
-            commands::confirm_freeze_capture,
-            commands::cancel_freeze,
-            commands::start_recording,
-            commands::stop_recording,
-            commands::pause_recording,
-            commands::resume_recording,
-            commands::discard_recording,
-        ])
-        .setup(move |app| {
-            let app_handle = app.handle().clone();
-            spawn_socket_server(app_handle);
-
-            if let Some(overlay_win) = app.get_webview_window("overlay") {
-                let _ = overlay_win.set_always_on_top(true);
-                let _ = overlay_win.set_skip_taskbar(true);
-            }
-
-            Ok(())
-        })
-        .build(tauri::generate_context!())
-        .expect("error while building vexrec tauri application");
-
-    app.run(move |_app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { api, .. } = event {
-            api.prevent_exit();
-        }
-    });
-}
-
-/// Runs the interactive GUI
 pub fn run_app() {
     run_daemon();
 }
 
-/// Runs as background daemon (starts hidden with socket server, no tray icon until recording)
 pub fn run_daemon() {
-    run_app_mode(true);
+    vexrec_pipeline::x11_capture::X11CaptureEngine::sanitize_display_env();
+
+    gtk::init().expect("Failed to initialize native GTK for Vexrec");
+    apply_dark_theme();
+
+    let app_state = AppState::new();
+
+    // 1. Settings Window
+    let settings_win = Rc::new(SettingsWindow::new(app_state.clone()));
+
+    // 2. Recording Frame Window
+    let frame_win = Rc::new(RecordingFrameWindow::new());
+
+    // 3. UI Command Channel (Thread-Safe Event Loop Bridge)
+    let (ui_sender, ui_receiver) = glib::MainContext::channel::<UiCommand>(glib::Priority::default());
+
+    // 4. Recording Indicator Window
+    let state_ind = app_state.clone();
+    let tx_ind = ui_sender.clone();
+
+    let indicator_win = Rc::new(RecordingIndicatorWindow::new(move || {
+        let state = state_ind.clone();
+        let tx = tx_ind.clone();
+
+        std::thread::spawn(move || {
+            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                let _ = rt.block_on(async { stop_recording_internal(&state).await });
+            }
+            let _ = tx.send(UiCommand::HideRecording);
+        });
+    }));
+
+    // 5. Freeze Overlay Window
+    let state_ov = app_state.clone();
+    let tx_ov = ui_sender.clone();
+    let settings_ov = settings_win.clone();
+
+    let overlay_win = FreezeOverlayWindow::new(
+        app_state.clone(),
+        move |crop, mic, audio| {
+            let state = state_ov.clone();
+            let tx = tx_ov.clone();
+            let show_frame = state.get_config().recording.show_recording_frame;
+
+            std::thread::spawn(move || {
+                let res = if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    rt.block_on(async {
+                        start_recording_pipeline(
+                            &state,
+                            crop,
+                            Some(60),
+                            Some("mp4".into()),
+                            Some(mic),
+                            Some(audio),
+                        )
+                        .await
+                    })
+                } else {
+                    Err("Runtime creation failed".into())
+                };
+
+                if res.is_ok() {
+                    let _ = tx.send(UiCommand::ShowRecording { crop, show_frame });
+                }
+            });
+        },
+        move || {
+            settings_ov.show();
+        },
+    );
+
+    // Attach receiver on main thread
+    let ov_rcv = overlay_win.clone();
+    let ind_rcv = indicator_win.clone();
+    let frame_rcv = frame_win.clone();
+
+    ui_receiver.attach(None, move |cmd| {
+        match cmd {
+            UiCommand::ShowFreeze => {
+                ov_rcv.show_freeze();
+            }
+            UiCommand::CancelFreeze => {
+                ov_rcv.cancel();
+            }
+            UiCommand::ShowRecording { crop, show_frame } => {
+                ind_rcv.show_indicator();
+                if show_frame {
+                    frame_rcv.show_frame(crop);
+                }
+            }
+            UiCommand::HideRecording => {
+                ind_rcv.hide_indicator();
+                frame_rcv.hide_frame();
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+
+    // 6. Start Background Socket Listener
+    spawn_native_socket_server(app_state, ui_sender);
+
+    gtk::main();
 }
