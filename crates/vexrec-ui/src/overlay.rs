@@ -50,6 +50,8 @@ pub struct OverviewWindow {
     pub thumbnail: Option<gdk_pixbuf::Pixbuf>,
     pub sub_pixbuf: Option<gdk_pixbuf::Pixbuf>,
     pub icon: Option<gdk_pixbuf::Pixbuf>,
+    pub live_image: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
+    pub full_pixbuf: Option<gdk_pixbuf::Pixbuf>,
 }
 
 #[derive(Clone)]
@@ -175,6 +177,84 @@ fn layout_overview_windows(windows: &mut [OverviewWindow], screen_w: f64, screen
             current_idx += 1;
         }
     }
+}
+
+fn build_overview_windows(
+    win_infos: Vec<vexrec_pipeline::x11_capture::WindowInfo>,
+    screen_w: f64,
+    screen_h: f64,
+    fallback_pb: Option<&gdk_pixbuf::Pixbuf>,
+) -> Vec<OverviewWindow> {
+    let mut overview_windows = Vec::new();
+
+    for info in win_infos {
+        let (full_pb, live_img) = if let Some(ref img) = info.live_image {
+            let (lw, lh) = img.dimensions();
+            let raw = img.clone().into_raw();
+            let bytes = glib::Bytes::from(&raw);
+            let pb = gdk_pixbuf::Pixbuf::from_bytes(
+                &bytes,
+                gdk_pixbuf::Colorspace::Rgb,
+                true,
+                8,
+                lw as i32,
+                lh as i32,
+                (lw * 4) as i32,
+            );
+            (Some(pb), Some(img.clone()))
+        } else if let Some(root_pb) = fallback_pb {
+            let px = info.rect.x.clamp(0, (screen_w as i32 - 1).max(0));
+            let py = info.rect.y.clamp(0, (screen_h as i32 - 1).max(0));
+            let pw = (info.rect.width as i32).min(screen_w as i32 - px).max(1);
+            let ph = (info.rect.height as i32).min(screen_h as i32 - py).max(1);
+            let sub = root_pb.new_subpixbuf(px, py, pw, ph);
+            (Some(sub), None)
+        } else {
+            (None, None)
+        };
+
+        let icon_pb = if let Some((iw, ih, ref rgba)) = info.icon_rgba {
+            let icon_bytes = glib::Bytes::from(rgba);
+            let pb = gdk_pixbuf::Pixbuf::from_bytes(
+                &icon_bytes,
+                gdk_pixbuf::Colorspace::Rgb,
+                true,
+                8,
+                iw as i32,
+                ih as i32,
+                (iw * 4) as i32,
+            );
+            pb.scale_simple(42, 42, gdk_pixbuf::InterpType::Bilinear)
+        } else {
+            gtk::IconTheme::default().and_then(|t| {
+                t.load_icon(&info.class_name.to_lowercase(), 42, gtk::IconLookupFlags::GENERIC_FALLBACK).ok().flatten()
+            })
+        };
+
+        overview_windows.push(OverviewWindow {
+            xid: info.xid,
+            title: info.title,
+            class_name: info.class_name,
+            screen_rect: info.rect,
+            slot_rect: (0.0, 0.0, 0.0, 0.0),
+            thumbnail: None,
+            sub_pixbuf: full_pb.clone(),
+            icon: icon_pb,
+            live_image: live_img,
+            full_pixbuf: full_pb,
+        });
+    }
+
+    layout_overview_windows(&mut overview_windows, screen_w, screen_h);
+
+    for ow in &mut overview_windows {
+        let (_, _, sw, sh) = ow.slot_rect;
+        if let Some(ref fpb) = ow.full_pixbuf {
+            ow.thumbnail = fpb.scale_simple(sw.max(1.0) as i32, sh.max(1.0) as i32, gdk_pixbuf::InterpType::Bilinear);
+        }
+    }
+
+    overview_windows
 }
 
 impl FreezeOverlayWindow {
@@ -438,7 +518,14 @@ impl FreezeOverlayWindow {
                     rounded_rectangle(cr, cur_x, cur_y, cur_w, cur_h, corner_r);
                     cr.save().unwrap();
                     cr.clip();
-                    if let Some(ref pb) = inner.pixbuf {
+                    if let Some(ref fpb) = win.full_pixbuf {
+                        let fw = fpb.width() as f64;
+                        let fh = fpb.height() as f64;
+                        cr.translate(cur_x, cur_y);
+                        cr.scale(cur_w / fw, cur_h / fh);
+                        cr.set_source_pixbuf(fpb, 0.0, 0.0);
+                        let _ = cr.paint();
+                    } else if let Some(ref pb) = inner.pixbuf {
                         let sx = win.screen_rect.x as f64;
                         let sy = win.screen_rect.y as f64;
                         let sw = win.screen_rect.width as f64;
@@ -514,6 +601,11 @@ impl FreezeOverlayWindow {
                         let _ = cr.fill();
                     }
 
+                    // Card Base Background
+                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
+                    cr.set_source_rgba(0.12, 0.12, 0.16, 0.85);
+                    let _ = cr.fill();
+
                     // Card Thumbnail
                     rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
                     cr.save().unwrap();
@@ -583,6 +675,15 @@ impl FreezeOverlayWindow {
                 if let Some(ref pb) = inner.pixbuf {
                     cr.set_source_pixbuf(pb, 0.0, 0.0);
                     let _ = cr.paint();
+                }
+
+                if let Some(win_idx) = inner.window_region_selected {
+                    if let Some(win) = inner.windows.get(win_idx) {
+                        if let Some(ref fpb) = win.full_pixbuf {
+                            cr.set_source_pixbuf(fpb, win.screen_rect.x as f64, win.screen_rect.y as f64);
+                            let _ = cr.paint();
+                        }
+                    }
                 }
 
                 // Vignette Mask
@@ -723,11 +824,23 @@ impl FreezeOverlayWindow {
 
                 if let Some(idx) = clicked_idx {
                     if inner.target_mode == TargetMode::Window {
-                        let rect = inner.windows[idx].screen_rect;
-                        inner.crop = Some(rect);
-                        drop(inner);
-                        ov_press.confirm_screenshot(true, None);
-                        return glib::Propagation::Stop;
+                        let win = &inner.windows[idx];
+                        let win_xid = win.xid;
+                        let direct_img = win.live_image.clone().or_else(|| {
+                            X11CaptureEngine::capture_window(win_xid).ok()
+                        });
+
+                        if let Some(img) = direct_img {
+                            drop(inner);
+                            ov_press.confirm_direct_image(img, true, None);
+                            return glib::Propagation::Stop;
+                        } else {
+                            let rect = win.screen_rect;
+                            inner.crop = Some(rect);
+                            drop(inner);
+                            ov_press.confirm_screenshot(true, None);
+                            return glib::Propagation::Stop;
+                        }
                     } else if inner.target_mode == TargetMode::WindowRegion {
                         let slot = inner.windows[idx].slot_rect;
                         let srect = inner.windows[idx].screen_rect;
@@ -1160,6 +1273,27 @@ impl FreezeOverlayWindow {
             on_open_settings();
         });
 
+        // Periodic background refresh for Overview mode (shows windows live)
+        let ov_poll = overlay.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            if !ov_poll.window.is_visible() {
+                return glib::ControlFlow::Continue;
+            }
+
+            let should_refresh = {
+                let inner = ov_poll.inner.borrow();
+                (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
+                    && inner.window_region_selected.is_none()
+                    && inner.zoom_animation.is_none()
+            };
+
+            if should_refresh {
+                ov_poll.refresh_overview_windows();
+            }
+
+            glib::ControlFlow::Continue
+        });
+
         overlay
     }
 
@@ -1271,6 +1405,38 @@ impl FreezeOverlayWindow {
             }
         }
         drop(inner);
+
+        if target == TargetMode::Window || target == TargetMode::WindowRegion {
+            self.refresh_overview_windows();
+        }
+
+        self.drawing_area.queue_draw();
+    }
+
+    pub fn refresh_overview_windows(&self) {
+        let (screen_w, screen_h, root_pb, mouse_pos) = {
+            let inner = self.inner.borrow();
+            let (w, h) = inner.image.as_ref().map(|i| (i.width() as f64, i.height() as f64)).unwrap_or((1920.0, 1080.0));
+            (w, h, inner.pixbuf.clone(), inner.mouse_pos)
+        };
+
+        let win_infos = X11CaptureEngine::enumerate_client_windows();
+        let new_windows = build_overview_windows(win_infos, screen_w, screen_h, root_pb.as_ref());
+
+        let (mx, my) = mouse_pos;
+        let mut hovered = None;
+        for (idx, win) in new_windows.iter().enumerate() {
+            let (sx, sy, sw, sh) = win.slot_rect;
+            if mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh {
+                hovered = Some(idx);
+                break;
+            }
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        inner.windows = new_windows;
+        inner.hovered_window = hovered;
+        drop(inner);
         self.drawing_area.queue_draw();
     }
 
@@ -1296,72 +1462,152 @@ impl FreezeOverlayWindow {
         inner.action_mode = ActionMode::Screenshot;
     }
 
+    pub fn confirm_direct_image(
+        &self,
+        image: ImageBuffer<Rgba<u8>, Vec<u8>>,
+        copy_to_clipboard: bool,
+        custom_path: Option<std::path::PathBuf>,
+    ) {
+        self.cancel();
+        self.finalize_captured_image(image, copy_to_clipboard, custom_path);
+    }
+
+    fn finalize_captured_image(
+        &self,
+        image: ImageBuffer<Rgba<u8>, Vec<u8>>,
+        copy_to_clipboard: bool,
+        custom_path: Option<std::path::PathBuf>,
+    ) {
+        if copy_to_clipboard {
+            let (w, h) = image.dimensions();
+            let raw = image.clone().into_raw();
+            let bytes = glib::Bytes::from(&raw);
+            let pb = gdk_pixbuf::Pixbuf::from_bytes(
+                &bytes,
+                gdk_pixbuf::Colorspace::Rgb,
+                true,
+                8,
+                w as i32,
+                h as i32,
+                (w * 4) as i32,
+            );
+            let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+            clipboard.set_image(&pb);
+            clipboard.store();
+
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_image(arboard::ImageData {
+                    width: w as usize,
+                    height: h as usize,
+                    bytes: std::borrow::Cow::Borrowed(&raw),
+                });
+            }
+        }
+
+        let cfg = self.app_state.get_config();
+        let out_path = custom_path.unwrap_or_else(|| {
+            let dir = expand_path(&cfg.storage.screenshot_dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
+            ensure_unique_path(dir.join(format!("Vexrec_{}.png", now)))
+        });
+
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        if let Ok(()) = SnapshotEngine::save_image(&image, &out_path) {
+            crate::commands::notify_with_open_action(
+                "camera-photo",
+                "Screenshot Captured",
+                &format!("Saved to {}", out_path.display()),
+                &out_path,
+            );
+        }
+    }
+
     pub fn confirm_screenshot(&self, copy_to_clipboard: bool, custom_path: Option<std::path::PathBuf>) {
-        let (img, crop) = {
+        let (img, crop, target_mode, hovered_idx, selected_window) = {
             let inner = self.inner.borrow();
-            (inner.image.clone(), inner.crop)
+            let sel_win = inner.window_region_selected.and_then(|idx| inner.windows.get(idx).cloned());
+            (
+                inner.image.clone(),
+                inner.crop,
+                inner.target_mode,
+                inner.hovered_window,
+                sel_win,
+            )
         };
+
+        if target_mode == TargetMode::Window && selected_window.is_none() {
+            let target_win = hovered_idx
+                .and_then(|idx| self.inner.borrow().windows.get(idx).cloned())
+                .or_else(|| {
+                    let in_ref = self.inner.borrow();
+                    if in_ref.windows.len() == 1 {
+                        in_ref.windows.first().cloned()
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(win) = target_win {
+                let direct_img = win.live_image.clone().or_else(|| {
+                    X11CaptureEngine::capture_window(win.xid).ok()
+                });
+                if let Some(img) = direct_img {
+                    self.cancel();
+                    self.finalize_captured_image(img, copy_to_clipboard, custom_path);
+                    return;
+                }
+            }
+        }
 
         self.cancel();
 
-        if let Some(mut image) = img {
-            if let Some(r) = crop {
-                let (w, h) = image.dimensions();
-                let rx = (r.x as u32).min(w.saturating_sub(1));
-                let ry = (r.y as u32).min(h.saturating_sub(1));
-                let rw = r.width.min(w.saturating_sub(rx));
-                let rh = r.height.min(h.saturating_sub(ry));
-                if rw > 0 && rh > 0 {
-                    image = image::imageops::crop_imm(&image, rx, ry, rw, rh).to_image();
+        let final_image = if let Some(ref win) = selected_window {
+            if let Some(ref win_img) = win.live_image {
+                if let Some(r) = crop {
+                    let (win_w, win_h) = win_img.dimensions();
+                    let rel_x = (r.x - win.screen_rect.x).max(0) as u32;
+                    let rel_y = (r.y - win.screen_rect.y).max(0) as u32;
+                    let rx = rel_x.min(win_w.saturating_sub(1));
+                    let ry = rel_y.min(win_h.saturating_sub(1));
+                    let rw = r.width.min(win_w.saturating_sub(rx));
+                    let rh = r.height.min(win_h.saturating_sub(ry));
+                    if rw > 0 && rh > 0 {
+                        Some(image::imageops::crop_imm(win_img, rx, ry, rw, rh).to_image())
+                    } else {
+                        Some(win_img.clone())
+                    }
+                } else {
+                    Some(win_img.clone())
                 }
+            } else {
+                None
             }
+        } else {
+            None
+        };
 
-            if copy_to_clipboard {
-                let (w, h) = image.dimensions();
-                let raw = image.clone().into_raw();
-                let bytes = glib::Bytes::from(&raw);
-                let pb = gdk_pixbuf::Pixbuf::from_bytes(
-                    &bytes,
-                    gdk_pixbuf::Colorspace::Rgb,
-                    true,
-                    8,
-                    w as i32,
-                    h as i32,
-                    (w * 4) as i32,
-                );
-                let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
-                clipboard.set_image(&pb);
-                clipboard.store();
-
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    let _ = cb.set_image(arboard::ImageData {
-                        width: w as usize,
-                        height: h as usize,
-                        bytes: std::borrow::Cow::Borrowed(&raw),
-                    });
+        let image_to_save = final_image.or_else(|| {
+            img.map(|mut image| {
+                if let Some(r) = crop {
+                    let (w, h) = image.dimensions();
+                    let rx = (r.x.max(0) as u32).min(w.saturating_sub(1));
+                    let ry = (r.y.max(0) as u32).min(h.saturating_sub(1));
+                    let rw = r.width.min(w.saturating_sub(rx));
+                    let rh = r.height.min(h.saturating_sub(ry));
+                    if rw > 0 && rh > 0 {
+                        image = image::imageops::crop_imm(&image, rx, ry, rw, rh).to_image();
+                    }
                 }
-            }
+                image
+            })
+        });
 
-            let cfg = self.app_state.get_config();
-            let out_path = custom_path.unwrap_or_else(|| {
-                let dir = expand_path(&cfg.storage.screenshot_dir);
-                let _ = std::fs::create_dir_all(&dir);
-                let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-                ensure_unique_path(dir.join(format!("Vexrec_{}.png", now)))
-            });
-
-            if let Some(parent) = out_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            if let Ok(()) = SnapshotEngine::save_image(&image, &out_path) {
-                crate::commands::notify_with_open_action(
-                    "camera-photo",
-                    "Screenshot Captured",
-                    &format!("Saved to {}", out_path.display()),
-                    &out_path,
-                );
-            }
+        if let Some(image) = image_to_save {
+            self.finalize_captured_image(image, copy_to_clipboard, custom_path);
         }
     }
 
@@ -1485,53 +1731,7 @@ impl FreezeOverlayWindow {
 
             // Enumerate open client windows for Overview mode
             let win_infos = X11CaptureEngine::enumerate_client_windows();
-            let mut overview_windows = Vec::new();
-
-            for info in win_infos {
-                let px = info.rect.x.clamp(0, (w - 1) as i32);
-                let py = info.rect.y.clamp(0, (h - 1) as i32);
-                let pw = (info.rect.width as i32).min((w as i32) - px).max(1);
-                let ph = (info.rect.height as i32).min((h as i32) - py).max(1);
-                let thumb_pb = pixbuf.new_subpixbuf(px, py, pw, ph);
-
-                let icon_pb = if let Some((iw, ih, ref rgba)) = info.icon_rgba {
-                    let icon_bytes = glib::Bytes::from(rgba);
-                    let pb = gdk_pixbuf::Pixbuf::from_bytes(
-                        &icon_bytes,
-                        gdk_pixbuf::Colorspace::Rgb,
-                        true,
-                        8,
-                        iw as i32,
-                        ih as i32,
-                        (iw * 4) as i32,
-                    );
-                    pb.scale_simple(42, 42, gdk_pixbuf::InterpType::Bilinear)
-                } else {
-                    gtk::IconTheme::default().and_then(|t| {
-                        t.load_icon(&info.class_name.to_lowercase(), 42, gtk::IconLookupFlags::GENERIC_FALLBACK).ok().flatten()
-                    })
-                };
-
-                overview_windows.push(OverviewWindow {
-                    xid: info.xid,
-                    title: info.title,
-                    class_name: info.class_name,
-                    screen_rect: info.rect,
-                    slot_rect: (0.0, 0.0, 0.0, 0.0),
-                    thumbnail: None,
-                    sub_pixbuf: Some(thumb_pb),
-                    icon: icon_pb,
-                });
-            }
-
-            layout_overview_windows(&mut overview_windows, w as f64, h as f64);
-
-            for ow in &mut overview_windows {
-                let (_, _, sw, sh) = ow.slot_rect;
-                if let Some(ref sub) = ow.sub_pixbuf {
-                    ow.thumbnail = sub.scale_simple(sw as i32, sh as i32, gdk_pixbuf::InterpType::Bilinear);
-                }
-            }
+            let overview_windows = build_overview_windows(win_infos, w as f64, h as f64, Some(&pixbuf));
 
             let cfg = self.app_state.get_config();
             let mut inner = self.inner.borrow_mut();

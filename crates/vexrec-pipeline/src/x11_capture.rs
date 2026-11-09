@@ -678,16 +678,110 @@ impl X11CaptureEngine {
                 }
             }
 
+            // Capture direct window buffer
+            let capture_target = if let Some(tree) = conn.query_tree(win).ok().and_then(|c| c.reply().ok()) {
+                if tree.parent != root {
+                    if let Some(p_geom) = conn.get_geometry(tree.parent).ok().and_then(|c| c.reply().ok()) {
+                        if p_geom.width >= geom.width && p_geom.height >= geom.height {
+                            tree.parent
+                        } else {
+                            win
+                        }
+                    } else {
+                        win
+                    }
+                } else {
+                    win
+                }
+            } else {
+                win
+            };
+
+            let live_image = Self::capture_drawable(&conn, capture_target)
+                .or_else(|| Self::capture_drawable(&conn, win));
+
             windows.push(WindowInfo {
                 xid: win,
                 title,
                 class_name,
                 rect: Rect::new(final_x, final_y, final_w, final_h),
                 icon_rgba,
+                live_image,
             });
         }
 
         windows
+    }
+
+    /// Captures a live image directly from any X11 drawable (window or pixmap)
+    pub fn capture_drawable(
+        conn: &impl x11rb::connection::Connection,
+        drawable: u32,
+    ) -> Option<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+        let geom = conn.get_geometry(drawable).ok()?.reply().ok()?;
+        let width = geom.width;
+        let height = geom.height;
+        if width < 10 || height < 10 {
+            return None;
+        }
+
+        let reply = conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                drawable,
+                0,
+                0,
+                width,
+                height,
+                !0,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+
+        let raw_data = reply.data;
+        let mut rgba: Vec<u8> = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for chunk in raw_data.chunks_exact(4) {
+            rgba.push(chunk[2]); // R
+            rgba.push(chunk[1]); // G
+            rgba.push(chunk[0]); // B
+            rgba.push(255u8);    // A
+        }
+
+        ImageBuffer::from_raw(width as u32, height as u32, rgba)
+    }
+
+    /// Captures an individual client window directly, including frame decorations if available
+    pub fn capture_window(win: u32) -> Result<ImageBuffer<Rgba<u8>, Vec<u8>>> {
+        let (conn, screen_num) = x11rb::connect(None)
+            .map_err(|e| VexrecError::Pipeline(format!("Failed to connect to X11 display: {e}")))?;
+        let root = conn.setup().roots[screen_num].root;
+
+        let capture_target = if let Some(tree) = conn.query_tree(win).ok().and_then(|c| c.reply().ok()) {
+            if tree.parent != root {
+                if let Some(p_geom) = conn.get_geometry(tree.parent).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(w_geom) = conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) {
+                        if p_geom.width >= w_geom.width && p_geom.height >= w_geom.height {
+                            tree.parent
+                        } else {
+                            win
+                        }
+                    } else {
+                        win
+                    }
+                } else {
+                    win
+                }
+            } else {
+                win
+            }
+        } else {
+            win
+        };
+
+        Self::capture_drawable(&conn, capture_target)
+            .or_else(|| Self::capture_drawable(&conn, win))
+            .ok_or_else(|| VexrecError::Pipeline(format!("Failed to capture window {win}")))
     }
 }
 
@@ -698,6 +792,7 @@ pub struct WindowInfo {
     pub class_name: String,
     pub rect: Rect,
     pub icon_rgba: Option<(u32, u32, Vec<u8>)>,
+    pub live_image: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -712,9 +807,10 @@ mod tests {
         let windows = X11CaptureEngine::enumerate_client_windows();
         println!("Enumerated {} windows", windows.len());
         for win in &windows {
-            println!("Window: {} ({}) - {:?}", win.title, win.class_name, win.rect);
+            println!("Window: {} ({}) - {:?}, has_image={}", win.title, win.class_name, win.rect, win.live_image.is_some());
         }
         assert!(windows.len() > 0);
+        assert!(windows.iter().any(|w| w.live_image.is_some()));
     }
 }
 
