@@ -228,6 +228,10 @@ async fn main() -> anyhow::Result<()> {
             let use_x11 = (x11 || (!portal && !interactive)) && X11CaptureEngine::is_available();
 
             if use_x11 {
+                // If the daemon is running with an open freeze overlay, cancel it first so it doesn't self-capture
+                if vexrec_ui::send_daemon_command("cancel_freeze").await.is_ok() {
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                }
                 println!("Capturing screen via direct X11 engine...");
                 let img = X11CaptureEngine::capture_screen(crop_rect)?;
 

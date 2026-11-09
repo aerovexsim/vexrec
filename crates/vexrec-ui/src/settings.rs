@@ -193,4 +193,8 @@ impl SettingsWindow {
         self.window.show_all();
         self.window.present();
     }
+
+    pub fn hide(&self) {
+        self.window.hide();
+    }
 }

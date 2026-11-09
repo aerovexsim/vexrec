@@ -1,4 +1,4 @@
-use gdk::prelude::GdkContextExt;
+use gdk::prelude::*;
 use gtk::prelude::*;
 use image::{ImageBuffer, Rgba};
 use std::cell::RefCell;
@@ -53,6 +53,7 @@ struct OverlayInner {
     mouse_pos: (f64, f64),
 }
 
+#[derive(Clone)]
 pub struct FreezeOverlayWindow {
     window: gtk::Window,
     drawing_area: gtk::DrawingArea,
@@ -89,6 +90,9 @@ impl FreezeOverlayWindow {
         window.set_keep_above(true);
         window.set_app_paintable(true);
         window.set_can_focus(true);
+        window.set_accept_focus(true);
+        window.set_focus_on_map(true);
+        window.set_modal(true);
         window.fullscreen();
 
         if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
@@ -136,10 +140,12 @@ impl FreezeOverlayWindow {
         mode_box.style_context().add_class("pill-group");
 
         let btn_mode_screenshot = gtk::Button::with_label("Screenshot");
+        btn_mode_screenshot.set_can_focus(false);
         btn_mode_screenshot.style_context().add_class("pill-button");
         btn_mode_screenshot.style_context().add_class("active");
 
         let btn_mode_record = gtk::Button::with_label("Record");
+        btn_mode_record.set_can_focus(false);
         btn_mode_record.style_context().add_class("pill-button");
 
         mode_box.pack_start(&btn_mode_screenshot, false, false, 0);
@@ -155,13 +161,16 @@ impl FreezeOverlayWindow {
         target_box.style_context().add_class("pill-group");
 
         let btn_tgt_selection = gtk::Button::with_label("Selection (1)");
+        btn_tgt_selection.set_can_focus(false);
         btn_tgt_selection.style_context().add_class("pill-button");
         btn_tgt_selection.style_context().add_class("active");
 
         let btn_tgt_window = gtk::Button::with_label("Window (2)");
+        btn_tgt_window.set_can_focus(false);
         btn_tgt_window.style_context().add_class("pill-button");
 
         let btn_tgt_fullscreen = gtk::Button::with_label("Full Screen (3)");
+        btn_tgt_fullscreen.set_can_focus(false);
         btn_tgt_fullscreen.style_context().add_class("pill-button");
 
         target_box.pack_start(&btn_tgt_selection, false, false, 0);
@@ -174,10 +183,12 @@ impl FreezeOverlayWindow {
         audio_box.style_context().add_class("pill-group");
 
         let btn_mic = gtk::Button::with_label("Mic: ON");
+        btn_mic.set_can_focus(false);
         btn_mic.style_context().add_class("pill-button");
         btn_mic.style_context().add_class("active");
 
         let btn_desktop_audio = gtk::Button::with_label("Audio: ON");
+        btn_desktop_audio.set_can_focus(false);
         btn_desktop_audio.style_context().add_class("pill-button");
         btn_desktop_audio.style_context().add_class("active");
 
@@ -193,14 +204,17 @@ impl FreezeOverlayWindow {
 
         // 4. Action Buttons
         let btn_done = gtk::Button::with_label("Done ↵");
+        btn_done.set_can_focus(false);
         btn_done.style_context().add_class("action-btn-done");
         bottom_pill.pack_start(&btn_done, false, false, 0);
 
         let btn_save_as = gtk::Button::with_label("Save As");
+        btn_save_as.set_can_focus(false);
         btn_save_as.style_context().add_class("pill-button");
         bottom_pill.pack_start(&btn_save_as, false, false, 0);
 
         let btn_record_action = gtk::Button::with_label("Record ↵");
+        btn_record_action.set_can_focus(false);
         btn_record_action.style_context().add_class("action-btn-record");
         btn_record_action.set_no_show_all(true);
         btn_record_action.hide();
@@ -208,11 +222,13 @@ impl FreezeOverlayWindow {
 
         // 5. Settings button
         let btn_settings = gtk::Button::with_label("Settings");
+        btn_settings.set_can_focus(false);
         btn_settings.style_context().add_class("pill-button");
         bottom_pill.pack_start(&btn_settings, false, false, 0);
 
         // 6. Cancel button
         let btn_cancel = gtk::Button::with_label("Cancel (Esc)");
+        btn_cancel.set_can_focus(false);
         btn_cancel.style_context().add_class("pill-button");
         bottom_pill.pack_start(&btn_cancel, false, false, 0);
 
@@ -460,54 +476,76 @@ impl FreezeOverlayWindow {
         });
 
         // Keyboard Shortcuts
-        let overlay_key = overlay.clone();
-        let start_rec_key = Rc::new(on_start_recording);
-        let start_rec_key_clone = start_rec_key.clone();
-        overlay.window.connect_key_press_event(move |_win, ev| {
-            match ev.keyval() {
-                gdk::keys::constants::Escape => {
-                    overlay_key.cancel();
-                    glib::Propagation::Stop
-                }
-                gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
-                    let mode = overlay_key.inner.borrow().action_mode;
-                    if mode == ActionMode::Screenshot {
-                        overlay_key.confirm_screenshot(true, None);
-                    } else {
-                        let crop = overlay_key.get_actual_crop();
-                        let mic = overlay_key.inner.borrow().mic_enabled;
-                        let audio = overlay_key.inner.borrow().desktop_audio_enabled;
+        let start_rec_shared = Rc::new(on_start_recording);
+        let handle_key = {
+            let overlay_key = overlay.clone();
+            let start_rec_key = start_rec_shared.clone();
+            Rc::new(move |ev: &gdk::EventKey| -> glib::Propagation {
+                match ev.keyval() {
+                    gdk::keys::constants::Escape => {
                         overlay_key.cancel();
-                        start_rec_key_clone(crop, mic, audio);
+                        glib::Propagation::Stop
                     }
-                    glib::Propagation::Stop
+                    gdk::keys::constants::Print => {
+                        overlay_key.show_freeze();
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
+                        let mode = overlay_key.inner.borrow().action_mode;
+                        if mode == ActionMode::Screenshot {
+                            overlay_key.confirm_screenshot(true, None);
+                        } else {
+                            let crop = overlay_key.get_actual_crop();
+                            let mic = overlay_key.inner.borrow().mic_enabled;
+                            let audio = overlay_key.inner.borrow().desktop_audio_enabled;
+                            overlay_key.cancel();
+                            start_rec_key(crop, mic, audio);
+                        }
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::c | gdk::keys::constants::C
+                        if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        overlay_key.confirm_screenshot(true, None);
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::s | gdk::keys::constants::S
+                        if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
+                    {
+                        overlay_key.save_screenshot_as();
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::_1 => {
+                        overlay_key.set_target_mode(TargetMode::Selection);
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::_2 => {
+                        overlay_key.set_target_mode(TargetMode::Window);
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::_3 => {
+                        overlay_key.set_target_mode(TargetMode::Fullscreen);
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
                 }
-                gdk::keys::constants::c | gdk::keys::constants::C
-                    if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
-                {
-                    overlay_key.confirm_screenshot(true, None);
-                    glib::Propagation::Stop
-                }
-                gdk::keys::constants::s | gdk::keys::constants::S
-                    if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
-                {
-                    overlay_key.save_screenshot_as();
-                    glib::Propagation::Stop
-                }
-                gdk::keys::constants::_1 => {
-                    overlay_key.set_target_mode(TargetMode::Selection);
-                    glib::Propagation::Stop
-                }
-                gdk::keys::constants::_2 => {
-                    overlay_key.set_target_mode(TargetMode::Window);
-                    glib::Propagation::Stop
-                }
-                gdk::keys::constants::_3 => {
-                    overlay_key.set_target_mode(TargetMode::Fullscreen);
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
+            })
+        };
+
+        let hk1 = handle_key.clone();
+        overlay.window.connect_key_press_event(move |_win, ev| hk1(ev));
+        let hk2 = handle_key;
+        overlay.drawing_area.connect_key_press_event(move |_da, ev| hk2(ev));
+
+        // Window Map / Unmap Hooks for Keyboard Grab
+        let ov_map = overlay.clone();
+        overlay.window.connect_map(move |_| {
+            ov_map.grab_keyboard();
+        });
+
+        let ov_unmap = overlay.clone();
+        overlay.window.connect_unmap(move |_| {
+            ov_unmap.ungrab_keyboard();
         });
 
         // Button Click Handlers
@@ -522,7 +560,7 @@ impl FreezeOverlayWindow {
         });
 
         let ov_rec = overlay.clone();
-        let start_rec_btn = start_rec_key.clone();
+        let start_rec_btn = start_rec_shared.clone();
         overlay.btn_record_action.connect_clicked(move |_| {
             let crop = ov_rec.get_actual_crop();
             let mic = ov_rec.inner.borrow().mic_enabled;
@@ -585,7 +623,9 @@ impl FreezeOverlayWindow {
             ov_cancel.cancel();
         });
 
+        let ov_settings = overlay.clone();
         btn_settings.connect_clicked(move |_| {
+            ov_settings.cancel();
             on_open_settings();
         });
 
@@ -677,11 +717,13 @@ impl FreezeOverlayWindow {
     }
 
     pub fn cancel(&self) {
+        self.ungrab_keyboard();
         self.window.hide();
         let mut inner = self.inner.borrow_mut();
         inner.crop = None;
         inner.image = None;
         inner.pixbuf = None;
+        inner.action_mode = ActionMode::Screenshot;
     }
 
     pub fn confirm_screenshot(&self, copy_to_clipboard: bool, custom_path: Option<std::path::PathBuf>) {
@@ -754,6 +796,7 @@ impl FreezeOverlayWindow {
     }
 
     pub fn save_screenshot_as(&self) {
+        self.ungrab_keyboard();
         let chooser = gtk::FileChooserNative::new(
             Some("Save Screenshot As"),
             Some(&self.window),
@@ -769,10 +812,72 @@ impl FreezeOverlayWindow {
             if let Some(chosen) = chooser.filename() {
                 self.confirm_screenshot(true, Some(chosen));
             }
+        } else if self.window.is_visible() {
+            self.grab_keyboard();
+        }
+    }
+
+    pub fn try_grab_seat(&self) -> bool {
+        if let Some(display) = gdk::Display::default() {
+            if let Some(seat) = display.default_seat() {
+                if let Some(gdk_win) = self.window.window() {
+                    gdk_win.focus(0);
+                    let status = seat.grab(
+                        &gdk_win,
+                        gdk::SeatCapabilities::KEYBOARD,
+                        false,
+                        None,
+                        None,
+                        None,
+                    );
+                    return status == gdk::GrabStatus::Success;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn grab_keyboard(&self) {
+        self.window.grab_focus();
+        self.drawing_area.grab_focus();
+        self.window.grab_add();
+        let _ = self.try_grab_seat();
+
+        // Retry seat grab in case window manager hotkey was still releasing
+        let retry = self.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if retry.window.is_visible() {
+                if !retry.try_grab_seat() {
+                    return glib::ControlFlow::Continue;
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    pub fn ungrab_keyboard(&self) {
+        self.window.grab_remove();
+        if let Some(display) = gdk::Display::default() {
+            if let Some(seat) = display.default_seat() {
+                seat.ungrab();
+            }
         }
     }
 
     pub fn show_freeze(&self) {
+        // If already visible, unmap and wait for compositor repaint to avoid self-capture
+        if self.window.is_visible() {
+            self.ungrab_keyboard();
+            self.window.hide();
+            while gtk::events_pending() {
+                gtk::main_iteration();
+            }
+            if let Some(display) = gdk::Display::default() {
+                display.sync();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+
         // Fast capture: Direct X11 or Portal
         let img_res: Result<ImageBuffer<Rgba<u8>, Vec<u8>>, VexrecError> = if X11CaptureEngine::is_available() {
             X11CaptureEngine::capture_screen(None)
@@ -825,9 +930,17 @@ impl FreezeOverlayWindow {
             }
             drop(inner);
 
+            // By default it should always be in Screenshot mode, Record mode should never be the default
+            self.set_action_mode(ActionMode::Screenshot);
+
             self.window.show_all();
             self.window.present();
             self.drawing_area.queue_draw();
+
+            while gtk::events_pending() {
+                gtk::main_iteration();
+            }
+            self.grab_keyboard();
         }
     }
 }

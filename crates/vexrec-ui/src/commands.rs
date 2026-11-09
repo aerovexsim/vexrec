@@ -44,13 +44,21 @@ pub fn notify_with_open_action(icon: &str, title: &str, body: &str, path: &std::
     let body = body.to_string();
     let path = path.to_path_buf();
 
+    let is_video = path.extension().map_or(false, |ext| {
+        let s = ext.to_string_lossy().to_ascii_lowercase();
+        s == "mp4" || s == "mkv" || s == "webm" || s == "mov"
+    });
+    let action_label = if is_video { "Open Video" } else { "Open Screenshot" };
+    let action_default = format!("default={}", action_label);
+    let action_open = format!("open={}", action_label);
+
     std::thread::spawn(move || {
         let output = std::process::Command::new("notify-send")
             .args([
                 "-a", "Vexrec",
                 "-i", icon.as_str(),
-                "-A", "default=Open Video",
-                "-A", "open=Open Video",
+                "-A", action_default.as_str(),
+                "-A", action_open.as_str(),
                 "-t", "10000",
                 "--wait",
                 title.as_str(),

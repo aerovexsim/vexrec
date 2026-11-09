@@ -349,10 +349,12 @@ pub fn run_daemon() {
     let ov_rcv = overlay_win.clone();
     let ind_rcv = indicator_win.clone();
     let frame_rcv = frame_win.clone();
+    let settings_rcv = settings_win.clone();
 
     ui_receiver.attach(None, move |cmd| {
         match cmd {
             UiCommand::ShowFreeze => {
+                settings_rcv.hide();
                 ov_rcv.show_freeze();
             }
             UiCommand::CancelFreeze => {
