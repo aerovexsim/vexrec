@@ -245,6 +245,12 @@ impl FreezeOverlayWindow {
         bottom_pill.set_valign(gtk::Align::End);
         bottom_pill.set_margin_bottom(32);
 
+        let provider = gtk::CssProvider::new();
+        if provider.load_from_data(crate::DARK_CSS.as_bytes()).is_ok() {
+            bottom_pill.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+            window.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
+        }
+
         // 1. Mode Switcher (Screenshot vs Record)
         let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         mode_box.style_context().add_class("pill-group");

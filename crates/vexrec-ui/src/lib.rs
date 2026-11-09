@@ -32,7 +32,7 @@ use vexrec_core::geometry::Rect;
 pub const SOCKET_PATH: &str = "/tmp/vexrec.sock";
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/luxrec.sock";
 
-const DARK_CSS: &str = r#"
+pub const DARK_CSS: &str = r#"
 window {
     background-color: transparent;
 }
@@ -43,6 +43,20 @@ window {
     border-radius: 20px;
     padding: 6px 12px;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+}
+
+.freeze-pill button,
+.freeze-pill button:backdrop {
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    border-image: none;
+    border: none;
+    border-width: 0px;
+    border-style: none;
+    border-color: transparent;
+    outline: none;
+    outline-width: 0px;
 }
 
 .pill-group {
@@ -57,56 +71,135 @@ window {
     margin: 4px 6px;
 }
 
-.pill-button {
+button.pill-button,
+button.pill-button:backdrop {
     background: transparent;
+    background-color: transparent;
+    background-image: none;
     border: none;
+    border-width: 0px;
+    border-style: none;
+    border-color: transparent;
+    outline: none;
+    outline-width: 0px;
+    box-shadow: none;
     border-radius: 9px;
     color: #a1a1aa;
     font-size: 11px;
     font-weight: 600;
     padding: 5px 11px;
-    box-shadow: none;
     transition: all 120ms ease;
+    opacity: 1.0;
 }
 
-.pill-button:hover {
+button.pill-button label,
+button.pill-button:backdrop label {
+    color: #a1a1aa;
+}
+
+button.pill-button:hover,
+button.pill-button:hover:backdrop {
     color: #ffffff;
     background-color: rgba(255, 255, 255, 0.1);
 }
 
-.pill-button.active {
+button.pill-button:hover label,
+button.pill-button:hover:backdrop label {
+    color: #ffffff;
+}
+
+button.pill-button.active,
+button.pill-button.active:backdrop {
     background-color: rgba(255, 255, 255, 0.22);
     color: #ffffff;
 }
 
-.action-btn-done {
+button.pill-button.active label,
+button.pill-button.active:backdrop label {
+    color: #ffffff;
+}
+
+button.action-btn-done,
+button.action-btn-done:backdrop,
+button.action-btn-done:focus,
+button.action-btn-done:active {
     background-color: #ffffff;
+    background-image: none;
     border: none;
+    border-width: 0px;
+    border-style: none;
+    border-color: transparent;
+    outline: none;
+    outline-width: 0px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
     border-radius: 12px;
     color: #09090b;
     font-size: 12px;
     font-weight: 700;
     padding: 6px 16px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    opacity: 1.0;
 }
 
-.action-btn-done:hover {
+button.action-btn-done label,
+button.action-btn-done:backdrop label,
+button.action-btn-done:focus label,
+button.action-btn-done:active label {
+    color: #09090b;
+    font-weight: 700;
+}
+
+button.action-btn-done:hover,
+button.action-btn-done:hover:backdrop {
     background-color: #f4f4f5;
+    background-image: none;
+    color: #000000;
+    opacity: 1.0;
 }
 
-.action-btn-record {
+button.action-btn-done:hover label,
+button.action-btn-done:hover:backdrop label {
+    color: #000000;
+}
+
+button.action-btn-record,
+button.action-btn-record:backdrop,
+button.action-btn-record:focus,
+button.action-btn-record:active {
     background-color: #ef4444;
+    background-image: none;
     border: none;
+    border-width: 0px;
+    border-style: none;
+    border-color: transparent;
+    outline: none;
+    outline-width: 0px;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
     border-radius: 12px;
     color: #ffffff;
     font-size: 12px;
     font-weight: 700;
     padding: 6px 16px;
-    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.35);
+    opacity: 1.0;
 }
 
-.action-btn-record:hover {
+button.action-btn-record label,
+button.action-btn-record:backdrop label,
+button.action-btn-record:focus label,
+button.action-btn-record:active label {
+    color: #ffffff;
+    font-weight: 700;
+}
+
+button.action-btn-record:hover,
+button.action-btn-record:hover:backdrop {
     background-color: #dc2626;
+    background-image: none;
+    opacity: 1.0;
+}
+
+button.action-btn-record:hover label,
+button.action-btn-record:hover:backdrop label {
+    color: #ffffff;
 }
 
 .indicator-pill {
@@ -182,7 +275,7 @@ fn apply_dark_theme() {
             gtk::StyleContext::add_provider_for_screen(
                 &screen,
                 &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                gtk::STYLE_PROVIDER_PRIORITY_USER,
             );
         }
     }
