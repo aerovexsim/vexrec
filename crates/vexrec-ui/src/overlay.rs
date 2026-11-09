@@ -11,10 +11,11 @@ use vexrec_pipeline::x11_capture::X11CaptureEngine;
 use vexrec_portal::PortalClient;
 use crate::app_state::{expand_path, AppState};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetMode {
     Selection,
     Window,
+    WindowRegion,
     Fullscreen,
 }
 
@@ -39,6 +40,27 @@ enum DragHandle {
     W,
 }
 
+#[derive(Clone)]
+pub struct OverviewWindow {
+    pub xid: u32,
+    pub title: String,
+    pub class_name: String,
+    pub screen_rect: Rect,
+    pub slot_rect: (f64, f64, f64, f64),
+    pub thumbnail: Option<gdk_pixbuf::Pixbuf>,
+    pub sub_pixbuf: Option<gdk_pixbuf::Pixbuf>,
+    pub icon: Option<gdk_pixbuf::Pixbuf>,
+}
+
+#[derive(Clone)]
+pub struct ZoomAnimation {
+    pub start_time: std::time::Instant,
+    pub duration: std::time::Duration,
+    pub from_rect: (f64, f64, f64, f64),
+    pub to_rect: (f64, f64, f64, f64),
+    pub window_idx: usize,
+}
+
 struct OverlayInner {
     image: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
     pixbuf: Option<gdk_pixbuf::Pixbuf>,
@@ -51,6 +73,10 @@ struct OverlayInner {
     drag_start: (f64, f64),
     initial_crop: Option<Rect>,
     mouse_pos: (f64, f64),
+    windows: Vec<OverviewWindow>,
+    hovered_window: Option<usize>,
+    zoom_animation: Option<ZoomAnimation>,
+    window_region_selected: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -69,7 +95,86 @@ pub struct FreezeOverlayWindow {
     btn_mode_record: gtk::Button,
     btn_tgt_selection: gtk::Button,
     btn_tgt_window: gtk::Button,
+    btn_tgt_window_region: gtk::Button,
     btn_tgt_fullscreen: gtk::Button,
+}
+
+fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let degrees = std::f64::consts::PI / 180.0;
+    cr.new_sub_path();
+    cr.arc(x + w - r, y + r, r, -90.0 * degrees, 0.0 * degrees);
+    cr.arc(x + w - r, y + h - r, r, 0.0 * degrees, 90.0 * degrees);
+    cr.arc(x + r, y + h - r, r, 90.0 * degrees, 180.0 * degrees);
+    cr.arc(x + r, y + r, r, 180.0 * degrees, 270.0 * degrees);
+    cr.close_path();
+}
+
+fn layout_overview_windows(windows: &mut [OverviewWindow], screen_w: f64, screen_h: f64) {
+    let n = windows.len();
+    if n == 0 {
+        return;
+    }
+
+    let margin_x = 70.0;
+    let margin_top = 85.0;
+    let margin_bottom = 115.0;
+    let avail_w = (screen_w - 2.0 * margin_x).max(100.0);
+    let avail_h = (screen_h - margin_top - margin_bottom).max(100.0);
+
+    let (rows, cols) = match n {
+        1 => (1, 1),
+        2 => (1, 2),
+        3 => (1, 3),
+        4 => (2, 2),
+        5 | 6 => (2, 3),
+        7 | 8 => (2, 4),
+        9..=12 => (3, 4),
+        _ => (3, ((n + 2) / 3).max(4)),
+    };
+
+    let gap_x = 28.0;
+    let gap_y = 36.0;
+
+    let cell_h = ((avail_h - (rows - 1) as f64 * gap_y) / rows as f64).max(50.0);
+    let cell_w = ((avail_w - (cols - 1) as f64 * gap_x) / cols as f64).max(50.0);
+
+    let mut row_counts = vec![n / rows; rows];
+    let remainder = n % rows;
+    for i in 0..remainder {
+        row_counts[i] += 1;
+    }
+
+    let mut current_idx = 0;
+    for (r, &count) in row_counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let row_total_w = count as f64 * cell_w + (count - 1) as f64 * gap_x;
+        let row_start_x = margin_x + (avail_w - row_total_w) / 2.0;
+        let row_start_y = margin_top + r as f64 * (cell_h + gap_y);
+
+        for j in 0..count {
+            if current_idx >= windows.len() {
+                break;
+            }
+            let cx = row_start_x + j as f64 * (cell_w + gap_x);
+            let cy = row_start_y;
+
+            let win = &mut windows[current_idx];
+            let native_w = win.screen_rect.width as f64;
+            let native_h = win.screen_rect.height as f64;
+
+            let scale = (cell_w / native_w.max(1.0)).min(cell_h / native_h.max(1.0)).min(1.0);
+            let thumb_w = (native_w * scale).round().max(20.0);
+            let thumb_h = (native_h * scale).round().max(20.0);
+            let thumb_x = (cx + (cell_w - thumb_w) / 2.0).round();
+            let thumb_y = (cy + (cell_h - thumb_h) / 2.0).round();
+
+            win.slot_rect = (thumb_x, thumb_y, thumb_w, thumb_h);
+            current_idx += 1;
+        }
+    }
 }
 
 impl FreezeOverlayWindow {
@@ -113,6 +218,10 @@ impl FreezeOverlayWindow {
             drag_start: (0.0, 0.0),
             initial_crop: None,
             mouse_pos: (0.0, 0.0),
+            windows: Vec::new(),
+            hovered_window: None,
+            zoom_animation: None,
+            window_region_selected: None,
         }));
 
         let overlay_container = gtk::Overlay::new();
@@ -123,7 +232,8 @@ impl FreezeOverlayWindow {
             gdk::EventMask::BUTTON_PRESS_MASK
                 | gdk::EventMask::BUTTON_RELEASE_MASK
                 | gdk::EventMask::POINTER_MOTION_MASK
-                | gdk::EventMask::KEY_PRESS_MASK,
+                | gdk::EventMask::KEY_PRESS_MASK
+                | gdk::EventMask::LEAVE_NOTIFY_MASK,
         );
 
         overlay_container.add(&drawing_area);
@@ -156,7 +266,7 @@ impl FreezeOverlayWindow {
         sep1.style_context().add_class("pill-separator");
         bottom_pill.pack_start(&sep1, false, false, 0);
 
-        // 2. Target Switcher (Selection, Window, Fullscreen)
+        // 2. Target Switcher (Selection, Window, Window Region, Fullscreen)
         let target_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
         target_box.style_context().add_class("pill-group");
 
@@ -169,12 +279,17 @@ impl FreezeOverlayWindow {
         btn_tgt_window.set_can_focus(false);
         btn_tgt_window.style_context().add_class("pill-button");
 
-        let btn_tgt_fullscreen = gtk::Button::with_label("Full Screen (3)");
+        let btn_tgt_window_region = gtk::Button::with_label("Window Region (3)");
+        btn_tgt_window_region.set_can_focus(false);
+        btn_tgt_window_region.style_context().add_class("pill-button");
+
+        let btn_tgt_fullscreen = gtk::Button::with_label("Full Screen (4)");
         btn_tgt_fullscreen.set_can_focus(false);
         btn_tgt_fullscreen.style_context().add_class("pill-button");
 
         target_box.pack_start(&btn_tgt_selection, false, false, 0);
         target_box.pack_start(&btn_tgt_window, false, false, 0);
+        target_box.pack_start(&btn_tgt_window_region, false, false, 0);
         target_box.pack_start(&btn_tgt_fullscreen, false, false, 0);
         bottom_pill.pack_start(&target_box, false, false, 0);
 
@@ -252,6 +367,7 @@ impl FreezeOverlayWindow {
             btn_mode_record,
             btn_tgt_selection,
             btn_tgt_window,
+            btn_tgt_window_region,
             btn_tgt_fullscreen,
         });
 
@@ -262,86 +378,313 @@ impl FreezeOverlayWindow {
             let win_w = _da.allocated_width() as f64;
             let win_h = _da.allocated_height() as f64;
 
-            // 1. Paint Screenshot Pixbuf
-            if let Some(ref pb) = inner.pixbuf {
-                cr.set_source_pixbuf(pb, 0.0, 0.0);
-                let _ = cr.paint();
-            }
+            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
+                && inner.window_region_selected.is_none()
+                && inner.zoom_animation.is_none();
 
-            // 2. Dimming Vignette Mask
-            if inner.target_mode != TargetMode::Fullscreen {
-                cr.set_fill_rule(cairo::FillRule::EvenOdd);
-                cr.rectangle(0.0, 0.0, win_w, win_h);
-                if let Some(r) = inner.crop {
-                    cr.rectangle(r.x as f64, r.y as f64, r.width as f64, r.height as f64);
+            if let Some(ref anim) = inner.zoom_animation {
+                // Smooth Zoom Animation
+                let elapsed = anim.start_time.elapsed().as_secs_f64() / anim.duration.as_secs_f64();
+                let t = (1.0 - (1.0 - elapsed.clamp(0.0, 1.0)).powi(3)).clamp(0.0, 1.0);
+
+                if let Some(ref pb) = inner.pixbuf {
+                    cr.set_source_pixbuf(pb, 0.0, 0.0);
+                    let _ = cr.paint();
                 }
-                cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
-                let _ = cr.fill();
-            }
 
-            // 3. Selection Rect & Handles
-            if inner.target_mode == TargetMode::Fullscreen {
-                cr.set_source_rgba(0.388, 0.400, 0.945, 0.85); // Indigo
-                cr.set_line_width(4.0);
+                let alpha_mask = 0.78 * (1.0 - t) + 0.45 * t;
+                cr.set_source_rgba(0.06, 0.06, 0.09, alpha_mask);
                 cr.rectangle(0.0, 0.0, win_w, win_h);
-                let _ = cr.stroke();
-            } else if let Some(r) = inner.crop {
-                if r.width > 2 && r.height > 2 {
-                    let rx = r.x as f64;
-                    let ry = r.y as f64;
-                    let rw = r.width as f64;
-                    let rh = r.height as f64;
+                let _ = cr.fill();
 
-                    // Border
+                let other_alpha = (1.0 - t).max(0.0);
+                if other_alpha > 0.01 {
+                    for (idx, win) in inner.windows.iter().enumerate() {
+                        if idx == anim.window_idx {
+                            continue;
+                        }
+                        let (sx, sy, sw, sh) = win.slot_rect;
+                        rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
+                        cr.save().unwrap();
+                        cr.clip();
+                        if let Some(ref thumb) = win.thumbnail {
+                            cr.set_source_pixbuf(thumb, sx, sy);
+                            let _ = cr.paint_with_alpha(other_alpha);
+                        }
+                        cr.restore().unwrap();
+
+                        rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.18 * other_alpha);
+                        cr.set_line_width(1.0);
+                        let _ = cr.stroke();
+                    }
+                }
+
+                if let Some(win) = inner.windows.get(anim.window_idx) {
+                    let (fx, fy, fw, fh) = anim.from_rect;
+                    let (tx, ty, tw, th) = anim.to_rect;
+                    let cur_x = fx + (tx - fx) * t;
+                    let cur_y = fy + (ty - fy) * t;
+                    let cur_w = fw + (tw - fw) * t;
+                    let cur_h = fh + (th - fh) * t;
+                    let corner_r = 10.0 * (1.0 - t);
+
+                    rounded_rectangle(cr, cur_x, cur_y, cur_w, cur_h, corner_r);
+                    cr.save().unwrap();
+                    cr.clip();
+                    if let Some(ref pb) = inner.pixbuf {
+                        let sx = win.screen_rect.x as f64;
+                        let sy = win.screen_rect.y as f64;
+                        let sw = win.screen_rect.width as f64;
+                        let sh = win.screen_rect.height as f64;
+                        cr.translate(cur_x, cur_y);
+                        cr.scale(cur_w / sw, cur_h / sh);
+                        cr.set_source_pixbuf(pb, -sx, -sy);
+                        let _ = cr.paint();
+                    }
+                    cr.restore().unwrap();
+
+                    rounded_rectangle(cr, cur_x, cur_y, cur_w, cur_h, corner_r);
                     cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
-                    cr.set_line_width(2.0);
-                    cr.rectangle(rx, ry, rw, rh);
+                    cr.set_line_width(2.5);
                     let _ = cr.stroke();
 
-                    // 8 Handles
-                    let draw_handle = |cr: &cairo::Context, hx: f64, hy: f64| {
-                        cr.set_source_rgb(1.0, 1.0, 1.0);
-                        cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
-                        let _ = cr.fill();
-                        cr.set_source_rgb(0.388, 0.400, 0.945);
-                        cr.set_line_width(1.5);
-                        cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
-                        let _ = cr.stroke();
-                    };
+                    if let Some(ref icon) = win.icon {
+                        let icon_alpha = (1.0 - t * 1.5).max(0.0);
+                        if icon_alpha > 0.01 {
+                            let ix = (cur_x + cur_w / 2.0 - 21.0).round();
+                            let iy = (cur_y + cur_h - 21.0).round();
+                            cr.set_source_pixbuf(icon, ix, iy);
+                            let _ = cr.paint_with_alpha(icon_alpha);
+                        }
+                    }
+                }
+            } else if is_overview {
+                if let Some(ref pb) = inner.pixbuf {
+                    cr.set_source_pixbuf(pb, 0.0, 0.0);
+                    let _ = cr.paint();
+                }
 
-                    draw_handle(cr, rx, ry); // NW
-                    draw_handle(cr, rx + rw / 2.0, ry); // N
-                    draw_handle(cr, rx + rw, ry); // NE
-                    draw_handle(cr, rx + rw, ry + rh / 2.0); // E
-                    draw_handle(cr, rx + rw, ry + rh); // SE
-                    draw_handle(cr, rx + rw / 2.0, ry + rh); // S
-                    draw_handle(cr, rx, ry + rh); // SW
-                    draw_handle(cr, rx, ry + rh / 2.0); // W
+                // Dark ambient backdrop matching GNOME Activities overview
+                cr.set_source_rgba(0.06, 0.06, 0.09, 0.78);
+                cr.rectangle(0.0, 0.0, win_w, win_h);
+                let _ = cr.fill();
 
-                    // Dimension Tooltip Badge
-                    let text = format!("{} × {} px", r.width, r.height);
-                    cr.select_font_face("Monospace", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                    cr.set_font_size(11.0);
-                    let extents = cr.text_extents(&text).unwrap();
-
-                    let badge_w = extents.width() + 16.0;
-                    let badge_h = 22.0;
-                    let badge_x = rx.max(4.0).min(win_w - badge_w - 4.0);
-                    let badge_y = (ry - badge_h - 6.0).max(4.0);
-
-                    // Badge background
-                    cr.set_source_rgba(0.094, 0.094, 0.106, 0.92);
-                    cr.rectangle(badge_x, badge_y, badge_w, badge_h);
+                // Top Header Pill
+                let header_text = if inner.target_mode == TargetMode::Window {
+                    "Click a window to capture"
+                } else {
+                    "Click a window to select a region"
+                };
+                cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                cr.set_font_size(13.0);
+                if let Ok(extents) = cr.text_extents(header_text) {
+                    let bw = extents.width() + 36.0;
+                    let bh = 32.0;
+                    let bx = (win_w - bw) / 2.0;
+                    let by = 36.0;
+                    rounded_rectangle(cr, bx, by, bw, bh, 16.0);
+                    cr.set_source_rgba(0.12, 0.12, 0.16, 0.92);
                     let _ = cr.fill();
+                    rounded_rectangle(cr, bx, by, bw, bh, 16.0);
                     cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
                     cr.set_line_width(1.0);
-                    cr.rectangle(badge_x, badge_y, badge_w, badge_h);
                     let _ = cr.stroke();
 
-                    // Badge text
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
-                    cr.move_to(badge_x + 8.0, badge_y + 15.0);
-                    let _ = cr.show_text(&text);
+                    cr.set_source_rgb(0.9, 0.9, 0.95);
+                    cr.move_to(bx + 18.0, by + 21.0);
+                    let _ = cr.show_text(header_text);
+                }
+
+                // Draw Windows Grid
+                for (idx, win) in inner.windows.iter().enumerate() {
+                    let is_hovered = inner.hovered_window == Some(idx);
+                    let (sx, sy, sw, sh) = win.slot_rect;
+
+                    // Hover Glow / Shadow
+                    if is_hovered {
+                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.25);
+                        rounded_rectangle(cr, sx - 4.0, sy - 4.0, sw + 8.0, sh + 8.0, 14.0);
+                        let _ = cr.fill();
+                    }
+
+                    // Card Thumbnail
+                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
+                    cr.save().unwrap();
+                    cr.clip();
+                    if let Some(ref thumb) = win.thumbnail {
+                        cr.set_source_pixbuf(thumb, sx, sy);
+                        let _ = cr.paint();
+                    }
+                    cr.restore().unwrap();
+
+                    // Card Border
+                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
+                    if is_hovered {
+                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
+                        cr.set_line_width(2.5);
+                    } else {
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.20);
+                        cr.set_line_width(1.0);
+                    }
+                    let _ = cr.stroke();
+
+                    // Centered Application Icon Badge floating at bottom edge
+                    let icon_size = 42.0;
+                    let ix = (sx + sw / 2.0 - icon_size / 2.0).round();
+                    let iy = (sy + sh - icon_size / 2.0).round();
+
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
+                    cr.arc(ix + icon_size / 2.0, iy + icon_size / 2.0 + 2.0, icon_size / 2.0 + 2.0, 0.0, 2.0 * std::f64::consts::PI);
+                    let _ = cr.fill();
+
+                    if let Some(ref icon) = win.icon {
+                        cr.set_source_pixbuf(icon, ix, iy);
+                        let _ = cr.paint();
+                    }
+
+                    // Hover Tooltip Badge above thumbnail
+                    if is_hovered && !win.title.is_empty() {
+                        let mut title_text = win.title.clone();
+                        if title_text.len() > 45 {
+                            title_text.truncate(42);
+                            title_text.push_str("...");
+                        }
+                        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                        cr.set_font_size(12.0);
+                        if let Ok(extents) = cr.text_extents(&title_text) {
+                            let tw = extents.width() + 24.0;
+                            let th = 26.0;
+                            let tx = (sx + sw / 2.0 - tw / 2.0).max(8.0).min(win_w - tw - 8.0);
+                            let ty = (sy - th - 8.0).max(8.0);
+
+                            rounded_rectangle(cr, tx, ty, tw, th, 13.0);
+                            cr.set_source_rgba(0.09, 0.09, 0.12, 0.95);
+                            let _ = cr.fill();
+                            rounded_rectangle(cr, tx, ty, tw, th, 13.0);
+                            cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
+                            cr.set_line_width(1.0);
+                            let _ = cr.stroke();
+
+                            cr.set_source_rgb(1.0, 1.0, 1.0);
+                            cr.move_to(tx + 12.0, ty + 18.0);
+                            let _ = cr.show_text(&title_text);
+                        }
+                    }
+                }
+            } else {
+                // Free Selection Mode or Zoomed Window Region
+                if let Some(ref pb) = inner.pixbuf {
+                    cr.set_source_pixbuf(pb, 0.0, 0.0);
+                    let _ = cr.paint();
+                }
+
+                // Vignette Mask
+                if inner.target_mode != TargetMode::Fullscreen {
+                    cr.set_fill_rule(cairo::FillRule::EvenOdd);
+                    cr.rectangle(0.0, 0.0, win_w, win_h);
+                    if let Some(r) = inner.crop {
+                        cr.rectangle(r.x as f64, r.y as f64, r.width as f64, r.height as f64);
+                    }
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+                    let _ = cr.fill();
+                }
+
+                // Header badge in Window Region Mode
+                if inner.target_mode == TargetMode::WindowRegion && inner.window_region_selected.is_some() {
+                    let win_idx = inner.window_region_selected.unwrap();
+                    let win_title = inner.windows.get(win_idx).map(|w| w.title.as_str()).unwrap_or("Window");
+                    let mut hint_title = win_title.to_string();
+                    if hint_title.len() > 35 {
+                        hint_title.truncate(32);
+                        hint_title.push_str("...");
+                    }
+                    let hint_text = format!("Window Region: {} — Esc to Overview", hint_title);
+                    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                    cr.set_font_size(12.0);
+                    if let Ok(extents) = cr.text_extents(&hint_text) {
+                        let bw = extents.width() + 32.0;
+                        let bh = 28.0;
+                        let bx = (win_w - bw) / 2.0;
+                        let by = 36.0;
+                        rounded_rectangle(cr, bx, by, bw, bh, 14.0);
+                        cr.set_source_rgba(0.09, 0.09, 0.12, 0.92);
+                        let _ = cr.fill();
+                        rounded_rectangle(cr, bx, by, bw, bh, 14.0);
+                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.7);
+                        cr.set_line_width(1.0);
+                        let _ = cr.stroke();
+
+                        cr.set_source_rgb(0.9, 0.9, 0.95);
+                        cr.move_to(bx + 16.0, by + 19.0);
+                        let _ = cr.show_text(&hint_text);
+                    }
+                }
+
+                // Selection Rect & Handles
+                if inner.target_mode == TargetMode::Fullscreen {
+                    cr.set_source_rgba(0.388, 0.400, 0.945, 0.85);
+                    cr.set_line_width(4.0);
+                    cr.rectangle(0.0, 0.0, win_w, win_h);
+                    let _ = cr.stroke();
+                } else if let Some(r) = inner.crop {
+                    if r.width > 2 && r.height > 2 {
+                        let rx = r.x as f64;
+                        let ry = r.y as f64;
+                        let rw = r.width as f64;
+                        let rh = r.height as f64;
+
+                        // Border
+                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
+                        cr.set_line_width(2.0);
+                        cr.rectangle(rx, ry, rw, rh);
+                        let _ = cr.stroke();
+
+                        // 8 Handles
+                        let draw_handle = |cr: &cairo::Context, hx: f64, hy: f64| {
+                            cr.set_source_rgb(1.0, 1.0, 1.0);
+                            cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
+                            let _ = cr.fill();
+                            cr.set_source_rgb(0.388, 0.400, 0.945);
+                            cr.set_line_width(1.5);
+                            cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
+                            let _ = cr.stroke();
+                        };
+
+                        draw_handle(cr, rx, ry); // NW
+                        draw_handle(cr, rx + rw / 2.0, ry); // N
+                        draw_handle(cr, rx + rw, ry); // NE
+                        draw_handle(cr, rx + rw, ry + rh / 2.0); // E
+                        draw_handle(cr, rx + rw, ry + rh); // SE
+                        draw_handle(cr, rx + rw / 2.0, ry + rh); // S
+                        draw_handle(cr, rx, ry + rh); // SW
+                        draw_handle(cr, rx, ry + rh / 2.0); // W
+
+                        // Dimension Tooltip Badge
+                        let text = format!("{} × {} px", r.width, r.height);
+                        cr.select_font_face("Monospace", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+                        cr.set_font_size(11.0);
+                        let extents = cr.text_extents(&text).unwrap();
+
+                        let badge_w = extents.width() + 16.0;
+                        let badge_h = 22.0;
+                        let badge_x = rx.max(4.0).min(win_w - badge_w - 4.0);
+                        let badge_y = (ry - badge_h - 6.0).max(4.0);
+
+                        // Badge background
+                        cr.set_source_rgba(0.094, 0.094, 0.106, 0.92);
+                        cr.rectangle(badge_x, badge_y, badge_w, badge_h);
+                        let _ = cr.fill();
+                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
+                        cr.set_line_width(1.0);
+                        cr.rectangle(badge_x, badge_y, badge_w, badge_h);
+                        let _ = cr.stroke();
+
+                        // Badge text
+                        cr.set_source_rgb(1.0, 1.0, 1.0);
+                        cr.move_to(badge_x + 8.0, badge_y + 15.0);
+                        let _ = cr.show_text(&text);
+                    }
                 }
             }
 
@@ -349,14 +692,83 @@ impl FreezeOverlayWindow {
         });
 
         // Set up Mouse Events
-        let inner_press = overlay.inner.clone();
+        let ov_press = overlay.clone();
         let da_press = overlay.drawing_area.clone();
         overlay.drawing_area.connect_button_press_event(move |_da, ev| {
             if ev.button() != 1 {
                 return glib::Propagation::Proceed;
             }
             let (ex, ey) = ev.position();
-            let mut inner = inner_press.borrow_mut();
+            let mut inner = ov_press.inner.borrow_mut();
+
+            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
+                && inner.window_region_selected.is_none()
+                && inner.zoom_animation.is_none();
+
+            if is_overview {
+                let mut clicked_idx = None;
+                for (idx, win) in inner.windows.iter().enumerate() {
+                    let (sx, sy, sw, sh) = win.slot_rect;
+                    if ex >= sx && ex <= sx + sw && ey >= sy && ey <= sy + sh {
+                        clicked_idx = Some(idx);
+                        break;
+                    }
+                }
+
+                if let Some(idx) = clicked_idx {
+                    if inner.target_mode == TargetMode::Window {
+                        let rect = inner.windows[idx].screen_rect;
+                        inner.crop = Some(rect);
+                        drop(inner);
+                        ov_press.confirm_screenshot(true, None);
+                        return glib::Propagation::Stop;
+                    } else if inner.target_mode == TargetMode::WindowRegion {
+                        let slot = inner.windows[idx].slot_rect;
+                        let srect = inner.windows[idx].screen_rect;
+                        let target_rect = (
+                            srect.x as f64,
+                            srect.y as f64,
+                            srect.width as f64,
+                            srect.height as f64,
+                        );
+                        inner.zoom_animation = Some(ZoomAnimation {
+                            start_time: std::time::Instant::now(),
+                            duration: std::time::Duration::from_millis(220),
+                            from_rect: slot,
+                            to_rect: target_rect,
+                            window_idx: idx,
+                        });
+                        drop(inner);
+
+                        let inner_anim = ov_press.inner.clone();
+                        let da_anim = da_press.clone();
+                        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+                            let mut in_ref = inner_anim.borrow_mut();
+                            if let Some(ref anim) = in_ref.zoom_animation {
+                                let elapsed = anim.start_time.elapsed().as_secs_f64() / anim.duration.as_secs_f64();
+                                if elapsed >= 1.0 {
+                                    let win_idx = anim.window_idx;
+                                    let srect = in_ref.windows.get(win_idx).map(|w| w.screen_rect);
+                                    in_ref.zoom_animation = None;
+                                    in_ref.window_region_selected = Some(win_idx);
+                                    if let Some(sr) = srect {
+                                        in_ref.crop = Some(sr);
+                                    }
+                                    da_anim.queue_draw();
+                                    return glib::ControlFlow::Break;
+                                }
+                            } else {
+                                return glib::ControlFlow::Break;
+                            }
+                            da_anim.queue_draw();
+                            glib::ControlFlow::Continue
+                        });
+
+                        return glib::Propagation::Stop;
+                    }
+                }
+                return glib::Propagation::Proceed;
+            }
 
             if inner.target_mode == TargetMode::Fullscreen {
                 return glib::Propagation::Proceed;
@@ -367,6 +779,8 @@ impl FreezeOverlayWindow {
             } else {
                 DragHandle::New
             };
+
+            Self::update_cursor(_da, handle);
 
             inner.drag_handle = handle;
             inner.drag_start = (ex, ey);
@@ -381,23 +795,80 @@ impl FreezeOverlayWindow {
             glib::Propagation::Proceed
         });
 
-        let inner_motion = overlay.inner.clone();
+        let ov_motion = overlay.clone();
         let da_motion = overlay.drawing_area.clone();
         overlay.drawing_area.connect_motion_notify_event(move |_da, ev| {
             let (ex, ey) = ev.position();
-            let mut inner = inner_motion.borrow_mut();
+            let mut inner = ov_motion.inner.borrow_mut();
             inner.mouse_pos = (ex, ey);
+
+            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
+                && inner.window_region_selected.is_none()
+                && inner.zoom_animation.is_none();
+
+            if is_overview {
+                let mut hovered = None;
+                for (idx, win) in inner.windows.iter().enumerate() {
+                    let (sx, sy, sw, sh) = win.slot_rect;
+                    if ex >= sx && ex <= sx + sw && ey >= sy && ey <= sy + sh {
+                        hovered = Some(idx);
+                        break;
+                    }
+                }
+
+                if inner.hovered_window != hovered {
+                    inner.hovered_window = hovered;
+                    da_motion.queue_draw();
+                }
+
+                if hovered.is_some() {
+                    if let Some(gdk_win) = _da.window() {
+                        let display = gdk_win.display();
+                        let cursor = gdk::Cursor::from_name(&display, "pointer")
+                            .or_else(|| gdk::Cursor::for_display(&display, gdk::CursorType::Hand2));
+                        gdk_win.set_cursor(cursor.as_ref());
+                    }
+                } else {
+                    if let Some(gdk_win) = _da.window() {
+                        gdk_win.set_cursor(None);
+                    }
+                }
+                return glib::Propagation::Proceed;
+            }
+
+            let active_handle = if inner.drag_handle != DragHandle::None {
+                inner.drag_handle
+            } else if let Some(r) = inner.crop {
+                Self::detect_handle(r, ex, ey)
+            } else {
+                DragHandle::New
+            };
+            Self::update_cursor(_da, active_handle);
 
             if inner.drag_handle != DragHandle::None {
                 let (sx, sy) = inner.drag_start;
                 let dx = ex - sx;
                 let dy = ey - sy;
 
+                let bounds = if let Some(widx) = inner.window_region_selected {
+                    inner.windows.get(widx).map(|w| w.screen_rect)
+                } else {
+                    None
+                };
+
                 if inner.drag_handle == DragHandle::New {
-                    let x1 = sx.min(ex);
-                    let y1 = sy.min(ey);
-                    let x2 = sx.max(ex);
-                    let y2 = sy.max(ey);
+                    let mut x1 = sx.min(ex);
+                    let mut y1 = sy.min(ey);
+                    let mut x2 = sx.max(ex);
+                    let mut y2 = sy.max(ey);
+
+                    if let Some(b) = bounds {
+                        x1 = x1.clamp(b.x as f64, (b.x + b.width as i32) as f64);
+                        y1 = y1.clamp(b.y as f64, (b.y + b.height as i32) as f64);
+                        x2 = x2.clamp(b.x as f64, (b.x + b.width as i32) as f64);
+                        y2 = y2.clamp(b.y as f64, (b.y + b.height as i32) as f64);
+                    }
+
                     inner.crop = Some(Rect::new(
                         x1 as i32,
                         y1 as i32,
@@ -406,10 +877,15 @@ impl FreezeOverlayWindow {
                     ));
                 } else if inner.drag_handle == DragHandle::Move {
                     if let Some(init) = inner.initial_crop {
-                        let win_w = _da.allocated_width();
-                        let win_h = _da.allocated_height();
-                        let nx = (init.x + dx as i32).clamp(0, (win_w - init.width as i32).max(0));
-                        let ny = (init.y + dy as i32).clamp(0, (win_h - init.height as i32).max(0));
+                        let (min_x, max_x, min_y, max_y) = if let Some(b) = bounds {
+                            (b.x, b.x + b.width as i32 - init.width as i32, b.y, b.y + b.height as i32 - init.height as i32)
+                        } else {
+                            let win_w = _da.allocated_width();
+                            let win_h = _da.allocated_height();
+                            (0, (win_w - init.width as i32).max(0), 0, (win_h - init.height as i32).max(0))
+                        };
+                        let nx = (init.x + dx as i32).clamp(min_x, max_x.max(min_x));
+                        let ny = (init.y + dy as i32).clamp(min_y, max_y.max(min_y));
                         inner.crop = Some(Rect::new(nx, ny, init.width, init.height));
                     }
                 } else if let Some(init) = inner.initial_crop {
@@ -456,6 +932,13 @@ impl FreezeOverlayWindow {
                         _ => {}
                     }
 
+                    if let Some(b) = bounds {
+                        x = x.clamp(b.x, b.x + b.width as i32 - 10);
+                        y = y.clamp(b.y, b.y + b.height as i32 - 10);
+                        w = w.min(b.x + b.width as i32 - x);
+                        h = h.min(b.y + b.height as i32 - y);
+                    }
+
                     inner.crop = Some(Rect::new(x.max(0), y.max(0), w.max(1) as u32, h.max(1) as u32));
                 }
 
@@ -465,13 +948,37 @@ impl FreezeOverlayWindow {
             glib::Propagation::Proceed
         });
 
-        let inner_release = overlay.inner.clone();
+        let ov_release = overlay.clone();
         let da_release = overlay.drawing_area.clone();
-        overlay.drawing_area.connect_button_release_event(move |_da, _ev| {
-            let mut inner = inner_release.borrow_mut();
+        overlay.drawing_area.connect_button_release_event(move |_da, ev| {
+            let (ex, ey) = ev.position();
+            let mut inner = ov_release.inner.borrow_mut();
             inner.drag_handle = DragHandle::None;
             inner.initial_crop = None;
+
+            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
+                && inner.window_region_selected.is_none()
+                && inner.zoom_animation.is_none();
+
+            if is_overview {
+                return glib::Propagation::Proceed;
+            }
+
+            let handle = if let Some(r) = inner.crop {
+                Self::detect_handle(r, ex, ey)
+            } else {
+                DragHandle::New
+            };
+            Self::update_cursor(_da, handle);
+
             da_release.queue_draw();
+            glib::Propagation::Proceed
+        });
+
+        overlay.drawing_area.connect_leave_notify_event(move |_da, _ev| {
+            if let Some(gdk_win) = _da.window() {
+                gdk_win.set_cursor(None);
+            }
             glib::Propagation::Proceed
         });
 
@@ -483,7 +990,16 @@ impl FreezeOverlayWindow {
             Rc::new(move |ev: &gdk::EventKey| -> glib::Propagation {
                 match ev.keyval() {
                     gdk::keys::constants::Escape => {
-                        overlay_key.cancel();
+                        let is_zoomed = overlay_key.inner.borrow().window_region_selected.is_some();
+                        if is_zoomed {
+                            let mut in_ref = overlay_key.inner.borrow_mut();
+                            in_ref.window_region_selected = None;
+                            in_ref.crop = None;
+                            drop(in_ref);
+                            overlay_key.drawing_area.queue_draw();
+                        } else {
+                            overlay_key.cancel();
+                        }
                         glib::Propagation::Stop
                     }
                     gdk::keys::constants::Print => {
@@ -524,6 +1040,10 @@ impl FreezeOverlayWindow {
                         glib::Propagation::Stop
                     }
                     gdk::keys::constants::_3 => {
+                        overlay_key.set_target_mode(TargetMode::WindowRegion);
+                        glib::Propagation::Stop
+                    }
+                    gdk::keys::constants::_4 => {
                         overlay_key.set_target_mode(TargetMode::Fullscreen);
                         glib::Propagation::Stop
                     }
@@ -589,6 +1109,11 @@ impl FreezeOverlayWindow {
             ov_tgt_win.set_target_mode(TargetMode::Window);
         });
 
+        let ov_tgt_winreg = overlay.clone();
+        overlay.btn_tgt_window_region.connect_clicked(move |_| {
+            ov_tgt_winreg.set_target_mode(TargetMode::WindowRegion);
+        });
+
         let ov_tgt_full = overlay.clone();
         overlay.btn_tgt_fullscreen.connect_clicked(move |_| {
             ov_tgt_full.set_target_mode(TargetMode::Fullscreen);
@@ -637,7 +1162,7 @@ impl FreezeOverlayWindow {
         let ry = r.y as f64;
         let rw = r.width as f64;
         let rh = r.height as f64;
-        const R: f64 = 10.0;
+        let r_bound = (rw.min(rh) / 2.0).clamp(6.0, 14.0);
 
         let dist = |hx: f64, hy: f64| -> f64 {
             let dx = x - hx;
@@ -645,26 +1170,53 @@ impl FreezeOverlayWindow {
             (dx * dx + dy * dy).sqrt()
         };
 
-        if dist(rx, ry) <= R {
+        // Prioritize corners so picking corner handles is immediate and responsive
+        if dist(rx, ry) <= r_bound {
             DragHandle::Nw
-        } else if dist(rx + rw / 2.0, ry) <= R {
-            DragHandle::N
-        } else if dist(rx + rw, ry) <= R {
+        } else if dist(rx + rw, ry) <= r_bound {
             DragHandle::Ne
-        } else if dist(rx + rw, ry + rh / 2.0) <= R {
-            DragHandle::E
-        } else if dist(rx + rw, ry + rh) <= R {
+        } else if dist(rx + rw, ry + rh) <= r_bound {
             DragHandle::Se
-        } else if dist(rx + rw / 2.0, ry + rh) <= R {
-            DragHandle::S
-        } else if dist(rx, ry + rh) <= R {
+        } else if dist(rx, ry + rh) <= r_bound {
             DragHandle::Sw
-        } else if dist(rx, ry + rh / 2.0) <= R {
+        } else if dist(rx + rw / 2.0, ry) <= r_bound {
+            DragHandle::N
+        } else if dist(rx + rw, ry + rh / 2.0) <= r_bound {
+            DragHandle::E
+        } else if dist(rx + rw / 2.0, ry + rh) <= r_bound {
+            DragHandle::S
+        } else if dist(rx, ry + rh / 2.0) <= r_bound {
             DragHandle::W
         } else if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh {
             DragHandle::Move
         } else {
             DragHandle::New
+        }
+    }
+
+    fn update_cursor(da: &gtk::DrawingArea, handle: DragHandle) {
+        if let Some(gdk_win) = da.window() {
+            let cursor_name = match handle {
+                DragHandle::Nw
+                | DragHandle::Ne
+                | DragHandle::Se
+                | DragHandle::Sw
+                | DragHandle::N
+                | DragHandle::S
+                | DragHandle::E
+                | DragHandle::W => "pointer",
+                DragHandle::Move => "move",
+                DragHandle::New => "crosshair",
+                DragHandle::None => "default",
+            };
+            let display = gdk_win.display();
+            let cursor = gdk::Cursor::from_name(&display, cursor_name).or_else(|| match cursor_name {
+                "pointer" => gdk::Cursor::for_display(&display, gdk::CursorType::Hand2),
+                "move" => gdk::Cursor::for_display(&display, gdk::CursorType::Fleur),
+                "crosshair" => gdk::Cursor::for_display(&display, gdk::CursorType::Crosshair),
+                _ => None,
+            });
+            gdk_win.set_cursor(cursor.as_ref());
         }
     }
 
@@ -689,9 +1241,13 @@ impl FreezeOverlayWindow {
     }
 
     pub fn set_target_mode(&self, target: TargetMode) {
-        self.inner.borrow_mut().target_mode = target;
+        let mut inner = self.inner.borrow_mut();
+        inner.target_mode = target;
+        inner.zoom_animation = None;
+        inner.window_region_selected = None;
         self.btn_tgt_selection.style_context().remove_class("active");
         self.btn_tgt_window.style_context().remove_class("active");
+        self.btn_tgt_window_region.style_context().remove_class("active");
         self.btn_tgt_fullscreen.style_context().remove_class("active");
 
         match target {
@@ -701,10 +1257,14 @@ impl FreezeOverlayWindow {
             TargetMode::Window => {
                 self.btn_tgt_window.style_context().add_class("active");
             }
+            TargetMode::WindowRegion => {
+                self.btn_tgt_window_region.style_context().add_class("active");
+            }
             TargetMode::Fullscreen => {
                 self.btn_tgt_fullscreen.style_context().add_class("active");
             }
         }
+        drop(inner);
         self.drawing_area.queue_draw();
     }
 
@@ -723,6 +1283,10 @@ impl FreezeOverlayWindow {
         inner.crop = None;
         inner.image = None;
         inner.pixbuf = None;
+        inner.windows.clear();
+        inner.hovered_window = None;
+        inner.zoom_animation = None;
+        inner.window_region_selected = None;
         inner.action_mode = ActionMode::Screenshot;
     }
 
@@ -913,10 +1477,64 @@ impl FreezeOverlayWindow {
                 (w * 4) as i32,
             );
 
+            // Enumerate open client windows for Overview mode
+            let win_infos = X11CaptureEngine::enumerate_client_windows();
+            let mut overview_windows = Vec::new();
+
+            for info in win_infos {
+                let px = info.rect.x.clamp(0, (w - 1) as i32);
+                let py = info.rect.y.clamp(0, (h - 1) as i32);
+                let pw = (info.rect.width as i32).min((w as i32) - px).max(1);
+                let ph = (info.rect.height as i32).min((h as i32) - py).max(1);
+                let thumb_pb = pixbuf.new_subpixbuf(px, py, pw, ph);
+
+                let icon_pb = if let Some((iw, ih, ref rgba)) = info.icon_rgba {
+                    let icon_bytes = glib::Bytes::from(rgba);
+                    let pb = gdk_pixbuf::Pixbuf::from_bytes(
+                        &icon_bytes,
+                        gdk_pixbuf::Colorspace::Rgb,
+                        true,
+                        8,
+                        iw as i32,
+                        ih as i32,
+                        (iw * 4) as i32,
+                    );
+                    pb.scale_simple(42, 42, gdk_pixbuf::InterpType::Bilinear)
+                } else {
+                    gtk::IconTheme::default().and_then(|t| {
+                        t.load_icon(&info.class_name.to_lowercase(), 42, gtk::IconLookupFlags::GENERIC_FALLBACK).ok().flatten()
+                    })
+                };
+
+                overview_windows.push(OverviewWindow {
+                    xid: info.xid,
+                    title: info.title,
+                    class_name: info.class_name,
+                    screen_rect: info.rect,
+                    slot_rect: (0.0, 0.0, 0.0, 0.0),
+                    thumbnail: None,
+                    sub_pixbuf: Some(thumb_pb),
+                    icon: icon_pb,
+                });
+            }
+
+            layout_overview_windows(&mut overview_windows, w as f64, h as f64);
+
+            for ow in &mut overview_windows {
+                let (_, _, sw, sh) = ow.slot_rect;
+                if let Some(ref sub) = ow.sub_pixbuf {
+                    ow.thumbnail = sub.scale_simple(sw as i32, sh as i32, gdk_pixbuf::InterpType::Bilinear);
+                }
+            }
+
             let cfg = self.app_state.get_config();
             let mut inner = self.inner.borrow_mut();
             inner.image = Some(img);
             inner.pixbuf = Some(pixbuf);
+            inner.windows = overview_windows;
+            inner.hovered_window = None;
+            inner.zoom_animation = None;
+            inner.window_region_selected = None;
 
             // Restore last region or default centered box
             if let Some(last_r) = cfg.screenshot.last_region {

@@ -414,5 +414,309 @@ impl X11CaptureEngine {
     pub fn grab_input_focus(window: u32) -> Result<()> {
         Self::activate_and_grab_focus(window)
     }
+
+    /// Enumerates all active top-level client windows suitable for overview selection
+    pub fn enumerate_client_windows() -> Vec<WindowInfo> {
+        let Ok((conn, screen_num)) = x11rb::connect(None) else {
+            return Vec::new();
+        };
+
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let screen_w = screen.width_in_pixels as i32;
+        let screen_h = screen.height_in_pixels as i32;
+
+        let Ok(client_list_atom) = conn.intern_atom(false, b"_NET_CLIENT_LIST").map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())) else {
+            return Vec::new();
+        };
+        let client_list_atom = client_list_atom.atom;
+
+        let net_wm_window_type = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let type_desktop = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let type_dock = conn.intern_atom(false, b"_NET_WM_WINDOW_TYPE_DOCK").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+
+        let net_wm_state = conn.intern_atom(false, b"_NET_WM_STATE").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let state_hidden = conn.intern_atom(false, b"_NET_WM_STATE_HIDDEN").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+
+        let net_frame_extents = conn.intern_atom(false, b"_NET_FRAME_EXTENTS").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let net_wm_name = conn.intern_atom(false, b"_NET_WM_NAME").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let net_wm_icon = conn.intern_atom(false, b"_NET_WM_ICON").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+        let net_wm_pid = conn.intern_atom(false, b"_NET_WM_PID").ok().and_then(|c| c.reply().ok()).map(|r| r.atom);
+
+        let current_pid = std::process::id();
+
+        let Ok(prop_reply) = conn.get_property(
+            false,
+            root,
+            client_list_atom,
+            x11rb::protocol::xproto::AtomEnum::WINDOW,
+            0,
+            1024,
+        ).map_err(|_| ()).and_then(|c| c.reply().map_err(|_| ())) else {
+            return Vec::new();
+        };
+
+        let Some(win_iter) = prop_reply.value32() else {
+            return Vec::new();
+        };
+
+        let mut windows = Vec::new();
+
+        for win in win_iter {
+            // Filter by PID
+            if let Some(pid_atom) = net_wm_pid {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    pid_atom,
+                    x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                    0,
+                    1,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(pid) = reply.value32().and_then(|mut it| it.next()) {
+                        if pid == current_pid {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Filter by Window Type (desktop, dock)
+            if let Some(wtype_atom) = net_wm_window_type {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    wtype_atom,
+                    x11rb::protocol::xproto::AtomEnum::ATOM,
+                    0,
+                    32,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(types) = reply.value32() {
+                        let is_desktop_or_dock = types.into_iter().any(|t| {
+                            Some(t) == type_desktop || Some(t) == type_dock
+                        });
+                        if is_desktop_or_dock {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Filter by State (hidden / minimized)
+            if let Some(state_atom) = net_wm_state {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    state_atom,
+                    x11rb::protocol::xproto::AtomEnum::ATOM,
+                    0,
+                    32,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(states) = reply.value32() {
+                        let is_hidden = states.into_iter().any(|s| Some(s) == state_hidden);
+                        if is_hidden {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Check Map State
+            if let Some(attrs) = conn.get_window_attributes(win).ok().and_then(|c| c.reply().ok()) {
+                if attrs.map_state != x11rb::protocol::xproto::MapState::VIEWABLE {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // Geometry
+            let Some(geom) = conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) else {
+                continue;
+            };
+            if geom.width < 50 || geom.height < 50 {
+                continue;
+            }
+
+            // Translate coordinates to root
+            let coords = conn.translate_coordinates(win, root, 0, 0)
+                .ok()
+                .and_then(|c| c.reply().ok());
+            let (raw_x, raw_y) = match coords {
+                Some(c) => (c.dst_x as i32, c.dst_y as i32),
+                None => (geom.x as i32, geom.y as i32),
+            };
+
+            // Frame Extents
+            let mut ext_l = 0i32;
+            let mut ext_r = 0i32;
+            let mut ext_t = 0i32;
+            let mut ext_b = 0i32;
+            if let Some(frame_atom) = net_frame_extents {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    frame_atom,
+                    x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                    0,
+                    4,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(mut extents) = reply.value32() {
+                        ext_l = extents.next().unwrap_or(0) as i32;
+                        ext_r = extents.next().unwrap_or(0) as i32;
+                        ext_t = extents.next().unwrap_or(0) as i32;
+                        ext_b = extents.next().unwrap_or(0) as i32;
+                    }
+                }
+            }
+
+            let wx = raw_x - ext_l;
+            let wy = raw_y - ext_t;
+            let ww = geom.width as i32 + ext_l + ext_r;
+            let wh = geom.height as i32 + ext_t + ext_b;
+
+            let final_x = wx.max(0).min(screen_w - 1);
+            let final_y = wy.max(0).min(screen_h - 1);
+            let final_w = (ww - (final_x - wx)).max(10).min(screen_w - final_x) as u32;
+            let final_h = (wh - (final_y - wy)).max(10).min(screen_h - final_y) as u32;
+
+            // Class name & title
+            let mut class_name = String::new();
+            if let Some(reply) = conn.get_property(
+                false,
+                win,
+                x11rb::protocol::xproto::AtomEnum::WM_CLASS,
+                x11rb::protocol::xproto::AtomEnum::STRING,
+                0,
+                256,
+            ).ok().and_then(|c| c.reply().ok()) {
+                let parts: Vec<&[u8]> = reply.value.split(|&b| b == 0).filter(|p| !p.is_empty()).collect();
+                if let Some(last) = parts.last() {
+                    class_name = String::from_utf8_lossy(last).to_string();
+                }
+            }
+
+            if class_name.eq_ignore_ascii_case("vexrec") {
+                continue;
+            }
+
+            let mut title = String::new();
+            if let Some(name_atom) = net_wm_name {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    name_atom,
+                    x11rb::protocol::xproto::AtomEnum::ANY,
+                    0,
+                    256,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if !reply.value.is_empty() {
+                        title = String::from_utf8_lossy(&reply.value).to_string();
+                    }
+                }
+            }
+            if title.is_empty() {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    x11rb::protocol::xproto::AtomEnum::WM_NAME,
+                    x11rb::protocol::xproto::AtomEnum::STRING,
+                    0,
+                    256,
+                ).ok().and_then(|c| c.reply().ok()) {
+                    title = String::from_utf8_lossy(&reply.value).to_string();
+                }
+            }
+
+            // Icon from _NET_WM_ICON
+            let mut icon_rgba = None;
+            if let Some(icon_atom) = net_wm_icon {
+                if let Some(reply) = conn.get_property(
+                    false,
+                    win,
+                    icon_atom,
+                    x11rb::protocol::xproto::AtomEnum::CARDINAL,
+                    0,
+                    262144, // up to 1MB of icon data
+                ).ok().and_then(|c| c.reply().ok()) {
+                    if let Some(vals) = reply.value32() {
+                        let all_vals: Vec<u32> = vals.collect();
+                        let mut idx = 0;
+                        let mut best_icon: Option<(u32, u32, usize)> = None;
+                        let mut best_diff = i32::MAX;
+
+                        while idx + 2 <= all_vals.len() {
+                            let iw = all_vals[idx];
+                            let ih = all_vals[idx + 1];
+                            let num_pixels = (iw as usize) * (ih as usize);
+                            if idx + 2 + num_pixels > all_vals.len() {
+                                break;
+                            }
+                            let diff = (iw as i32 - 48).abs();
+                            if diff < best_diff {
+                                best_diff = diff;
+                                best_icon = Some((iw, ih, idx + 2));
+                            }
+                            idx += 2 + num_pixels;
+                        }
+
+                        if let Some((iw, ih, start)) = best_icon {
+                            let mut rgba = Vec::with_capacity((iw * ih * 4) as usize);
+                            for p in &all_vals[start..start + (iw * ih) as usize] {
+                                let a = ((p >> 24) & 0xFF) as u8;
+                                let r = ((p >> 16) & 0xFF) as u8;
+                                let g = ((p >> 8) & 0xFF) as u8;
+                                let b = (p & 0xFF) as u8;
+                                rgba.push(r);
+                                rgba.push(g);
+                                rgba.push(b);
+                                rgba.push(a);
+                            }
+                            icon_rgba = Some((iw, ih, rgba));
+                        }
+                    }
+                }
+            }
+
+            windows.push(WindowInfo {
+                xid: win,
+                title,
+                class_name,
+                rect: Rect::new(final_x, final_y, final_w, final_h),
+                icon_rgba,
+            });
+        }
+
+        windows
+    }
 }
+
+#[derive(Clone, Debug)]
+pub struct WindowInfo {
+    pub xid: u32,
+    pub title: String,
+    pub class_name: String,
+    pub rect: Rect,
+    pub icon_rgba: Option<(u32, u32, Vec<u8>)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enumerate_client_windows() {
+        if !X11CaptureEngine::is_available() {
+            return;
+        }
+        let windows = X11CaptureEngine::enumerate_client_windows();
+        println!("Enumerated {} windows", windows.len());
+        for win in &windows {
+            println!("Window: {} ({}) - {:?}", win.title, win.class_name, win.rect);
+        }
+        assert!(windows.len() > 0);
+    }
+}
+
+
 

@@ -10,4 +10,4 @@ pub use camera::CameraPipelineBuilder;
 pub use encoders::EncoderConfig;
 pub use recorder::RecordingPipeline;
 pub use snapshot::SnapshotEngine;
-pub use x11_capture::X11CaptureEngine;
+pub use x11_capture::{X11CaptureEngine, WindowInfo};
